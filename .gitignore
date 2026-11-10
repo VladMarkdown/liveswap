@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Models (large files — download separately)
+models/*.onnx
+models/*.pth
+models/*.safetensors
+models/*.bin
+models/trt_cache/
+
+# Profiles (user data)
+profiles/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# TRT cache
+trt_cache/
+*.trt
+*.engine
