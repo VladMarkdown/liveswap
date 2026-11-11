@@ -835,6 +835,7 @@ class MainWindow(QMainWindow):
         self._closing  = False
         self._running  = False
         self._shown_errors = 0
+        self._capture_end_shown = False
 
         # --- Mode tracker (satisfies _tabs.currentIndex() contract) ---
         self._tabs = _ModeIndex()
@@ -1017,6 +1018,9 @@ class MainWindow(QMainWindow):
                 cam_data = self._cam_combo.currentData()
                 cam_idx = cam_data if isinstance(cam_data, int) else 0
                 cap = CaptureThread(cam_idx)
+                # Opens the camera and starts reading; without this the runner
+                # gets no frames at all. Raises if the camera is busy or missing.
+                cap.start()
 
                 self._signals.startup_ready.emit((pipeline, cap))
             except Exception as exc:
@@ -1034,6 +1038,7 @@ class MainWindow(QMainWindow):
         self._running = True
         self._starting = False
         self._shown_errors = 0
+        self._capture_end_shown = False
         self.statusBar().showMessage("Running")
 
         # Virtual camera
@@ -1091,6 +1096,11 @@ class MainWindow(QMainWindow):
                     "   ".join(f"{name} {stage_ms:.0f} ms" for name, stage_ms in slowest))
         # Frames that fail in the pipeline are passed through unprocessed; say so.
         runner = self._runner
+        if runner is not None and runner.capture_ended and not self._capture_end_shown:
+            self._capture_end_shown = True
+            self.statusBar().showMessage(
+                "The camera stopped delivering frames. Press Stop, check that no other "
+                "program is using the camera, and start again.")
         if runner is not None and runner.error_count != self._shown_errors:
             self._shown_errors = runner.error_count
             self.statusBar().showMessage(

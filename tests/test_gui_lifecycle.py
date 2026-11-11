@@ -90,3 +90,5 @@ class GuiLifecycleTests(unittest.TestCase):
         pipeline.set_profile.assert_not_called()
         signals.failed.emit.assert_not_called()
         signals.startup_ready.emit.assert_called_once_with((pipeline, cap))
+        # The capture must actually be started, or the runner never gets a frame.
+        cap.start.assert_called_once_with()

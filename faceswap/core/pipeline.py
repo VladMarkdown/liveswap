@@ -563,6 +563,8 @@ class AsyncPipelineRunner:
         # these let the GUI say so instead of failing silently.
         self.error_count = 0
         self.last_error = None
+        # True once the camera has stopped giving frames while the runner was running.
+        self.capture_ended = False
         self._output_times = deque(maxlen=30)
 
     @property
@@ -582,6 +584,7 @@ class AsyncPipelineRunner:
             while not mailbox.empty():
                 mailbox.get_nowait()
         self._output_times.clear()
+        self.capture_ended = False
         self._cap = cap
         chain = [self._pre_q, *self._stage_qs, self._post_q]
         stages = [(stage, chain[i], chain[i + 1]) for i, stage in enumerate(self._stages)]
@@ -626,10 +629,14 @@ class AsyncPipelineRunner:
             while not self._stop.is_set():
                 ret, frame = self._cap.read()
                 if not ret:
+                    if not self._stop.is_set():
+                        logger.warning('The camera stopped delivering frames')
+                        self.capture_ended = True
                     break
                 put_latest(self._raw_q, frame)
         except Exception:
             logger.exception('Capture failed')
+            self.capture_ended = True
         finally:
             put_latest(self._raw_q, STOP)
 
