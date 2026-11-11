@@ -12,15 +12,18 @@ import cv2
 import numpy as np
 
 from .detector import detect_largest
-from .aligner import estimate_transform, paste_back
+from .aligner import estimate_transform, paste_back, feather_coverage
 from .color import (
     reinhard_color_transfer, low_freq_shading_correction, inject_skin_detail,
     apply_sss, transfer_specular, composite_mouth_interior,
 )
-from .temporal import TransformSmoother, TemporalEMA
+from .temporal import FaceParamSmoother, TemporalEMA
 
 logger = logging.getLogger(__name__)
 STOP = object()
+
+_GPEN_BLEND_MAX  = 0.8
+_GPEN_BLEND_STEP = 0.08   # ramp over ~10 frames at enable/disable transitions
 
 
 def put_latest(mailbox: queue.Queue, item) -> None:
@@ -53,8 +56,7 @@ class SwapPipeline:
         self._source_face = source_face
         self._quality = quality
         self.frame_budget_ms = frame_budget_ms
-        self._smoother = TransformSmoother()
-        self._ffhq_smoother = TransformSmoother()
+        self._face_smoother = FaceParamSmoother()
         self._ema = TemporalEMA(base_weight=0.55)
         self._inference_times = deque(maxlen=30)
         self._base_times = deque(maxlen=30)
@@ -62,16 +64,24 @@ class SwapPipeline:
         self.last_inference_ms = 0.0
         self.gpen_skipped = 0
         self._last_frame_time = None
+        # GPEN hysteresis state: prevent 15 Hz flicker at budget boundary
+        self._enhance_enabled: bool = True
+        self._gpen_blend: float = 0.0
+        # Specular mask cache for temporal EMA (fix #9)
+        self._spec_mask_prev: np.ndarray | None = None
 
     @property
     def average_inference_ms(self) -> float:
         return sum(self._inference_times) / max(1, len(self._inference_times))
 
     def _reset_tracking(self):
-        self._smoother.reset()
-        self._ffhq_smoother.reset()
+        self._face_smoother.reset()
         self._ema.reset()
+        self._parser.reset()
         self._last_frame_time = None
+        self._enhance_enabled = True
+        self._gpen_blend = 0.0
+        self._spec_mask_prev = None
 
     def set_source_face(self, face) -> None:
         self._source_face = face
@@ -87,13 +97,18 @@ class SwapPipeline:
         self.set_source_face(source)
 
     def _should_enhance(self, elapsed_ms: float) -> bool:
-        if self._enhancer is None or self.last_inference_ms > self.frame_budget_ms:
+        if self._enhancer is None:
             return False
-        # First frame measures restoration cost. Subsequent decisions include
-        # the non-restoration rolling cost, allowing recovery after overload.
         base = sum(self._base_times) / max(1, len(self._base_times))
         gpen = sum(self._gpen_times) / max(1, len(self._gpen_times))
-        return max(base, elapsed_ms) + gpen <= self.frame_budget_ms
+        estimated = max(base, elapsed_ms) + gpen
+        # Hysteresis: disable when over budget, re-enable only at 85 % of budget.
+        # Eliminates the alternating on/off pattern that caused ~15 Hz texture flicker.
+        if estimated > self.frame_budget_ms:
+            self._enhance_enabled = False
+        elif estimated < self.frame_budget_ms * 0.85:
+            self._enhance_enabled = True
+        return self._enhance_enabled
 
     def process_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
         if self._source_face is None:
@@ -106,8 +121,13 @@ class SwapPipeline:
         dt = 1 / 30 if self._last_frame_time is None else max(1e-3, started - self._last_frame_time)
         self._last_frame_time = started
         _, width = frame_bgr.shape[:2]
-        M_swap = self._smoother.smooth(estimate_transform(target.kps, 256), width, dt)
-        M_ffhq = self._ffhq_smoother.smooth(estimate_transform(target.kps, 512), width, dt)
+
+        # Single smoother filters face params from raw landmarks, then derives
+        # both transforms from the same filtered geometry (fix #11: coupling).
+        filtered_kps = self._face_smoother.smooth(target.kps, dt)
+        M_swap = estimate_transform(filtered_kps, 256)
+        M_ffhq = estimate_transform(filtered_kps, 512)
+
         # Extract only AFTER smoothing; these exact transforms also define paste-back.
         crop_swap = cv2.warpAffine(frame_bgr, M_swap, (256, 256), borderMode=cv2.BORDER_REFLECT)
         crop_ffhq = cv2.warpAffine(frame_bgr, M_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
@@ -116,15 +136,19 @@ class SwapPipeline:
         ffhq_h = np.vstack((M_ffhq, [0, 0, 1]))
         to_ffhq = (ffhq_h @ np.linalg.inv(swap_h))[:2]
         aligned = cv2.warpAffine(swapped, to_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
-        # Never paste reflected pixels outside the actual swap crop's coverage.
-        coverage = cv2.warpAffine(np.ones((256, 256), np.float32), to_ffhq, (512, 512))
+        # Feathered coverage mask prevents hard boundary at the swap crop edge (fix #4).
+        coverage_raw = cv2.warpAffine(np.ones((256, 256), np.float32), to_ffhq, (512, 512))
+        coverage = feather_coverage(coverage_raw)
         gpen_ms = 0.0
         if self._should_enhance((time.perf_counter() - started) * 1000):
+            # Ramp blend weight in over ~10 frames to avoid a pop at enable (fix #2).
+            self._gpen_blend = min(_GPEN_BLEND_MAX, self._gpen_blend + _GPEN_BLEND_STEP)
             before = time.perf_counter()
-            enhanced = self._enhancer.enhance_with_blend(aligned, blend=0.8)
+            enhanced = self._enhancer.enhance_with_blend(aligned, blend=self._gpen_blend)
             gpen_ms = (time.perf_counter() - before) * 1000
             self._gpen_times.append(gpen_ms)
         else:
+            self._gpen_blend = max(0.0, self._gpen_blend - _GPEN_BLEND_STEP)
             enhanced = aligned
             self.gpen_skipped += 1
         # Ownership masks come from the target: restoration may erase glasses
@@ -133,19 +157,23 @@ class SwapPipeline:
         mask = self._parser.build_swap_mask(seg, erosion_px=3, transition_px=10) * coverage
         skin = self._parser.get_skin_mask(seg)
         mouth = self._parser.get_mouth_interior_mask(seg)
+        # Reinhard correction now applies only within the skin mask (fix C).
         result = reinhard_color_transfer(enhanced, crop_ffhq, mask=skin)
-        result = low_freq_shading_correction(result, crop_ffhq, sigma=20.0)
+        # Multiplicative shading correction in linear space, skin mask only (fix #7).
+        result = low_freq_shading_correction(result, crop_ffhq, sigma=20.0, skin_mask=skin)
         if self._quality == 'ultra':
             face_width = max(1, int(target.bbox[2] - target.bbox[0]))
             result = inject_skin_detail(result, crop_ffhq, skin, face_width, strength=0.20)
             result = apply_sss(result, skin, strength=0.20)
             # Use observed target detail instead of adding procedural skin texture.
-            result = transfer_specular(crop_ffhq, result, skin)
+            # transfer_specular returns (result, spec_mask) for temporal EMA (fix #9).
+            result, self._spec_mask_prev = transfer_specular(
+                crop_ffhq, result, skin, prev_spec=self._spec_mask_prev)
         result = composite_mouth_interior(result, crop_ffhq, mouth)
         full, frame_mask = paste_back(frame_bgr, result, M_ffhq, mask=mask, return_mask=True)
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         # Five-point landmarks lack eyelid contours: blink detection is disabled
-        # for MVP. Preserve current eye/mouth pixels instead of inventing EAR.
+        # for MVP (BlinkGate requires 6-pt eye landmarks for EAR computation).
         dynamic = self._parser.get_region_mask(seg, [4, 5, 11, 12, 13])
         dynamic = cv2.warpAffine(dynamic, cv2.invertAffineTransform(M_ffhq), (width, frame_bgr.shape[0]))
         temporal_mask = frame_mask * (1.0 - dynamic.astype(np.float32) / 255.0)

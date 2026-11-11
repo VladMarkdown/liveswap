@@ -7,6 +7,10 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+# Used to neutralize reflected/replicated edge pixels outside the face mask
+# before the pyramid spreads them into the blend transition zone.
+_DILATE_KERNEL = np.ones((17, 17), np.uint8)  # ~8px radius
+
 
 def laplacian_pyramid_blend(src: np.ndarray, dst: np.ndarray,
                              mask: np.ndarray, levels: int = 5) -> np.ndarray:
@@ -33,6 +37,12 @@ def laplacian_pyramid_blend(src: np.ndarray, dst: np.ndarray,
     # Expand mask to 3 channels
     if mask_f.ndim == 2:
         mask_f = np.stack([mask_f] * 3, axis=-1)
+
+    # Fill src outside dilated mask with dst content so that reflected/replicated
+    # edge pixels (from BORDER_REPLICATE warp) cannot bleed into the transition zone.
+    mask_binary = (mask_f[..., 0] > 0.01).astype(np.uint8)
+    dilated = cv2.dilate(mask_binary, _DILATE_KERNEL)[..., np.newaxis]
+    src_f = src_f * dilated + dst_f * (1 - dilated)
 
     # Build Gaussian pyramids
     gp_src = [src_f]

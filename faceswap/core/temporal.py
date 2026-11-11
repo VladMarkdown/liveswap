@@ -2,9 +2,15 @@
 Temporal consistency: One-Euro filter + EAR blink gate + motion-adaptive EMA.
 
 One-Euro filter applied to similarity transform parameters (NOT raw landmarks).
-Separate filter instance per parameter. Filter on normalized params (tx/W, ty/W).
+Separate filter instance per parameter. Filter on normalized params (tx/W, ty/H).
+
+FaceParamSmoother: preferred over TransformSmoother for the main pipeline.
+Filters (cx, cy, log_scale, rotation) extracted from raw 5-pt landmarks and
+reconstructs both M_swap-256 and M_ffhq-512 from the same filtered geometry,
+ensuring rotation-translation coupling across the two transforms.
 
 EAR blink gate: bypass temporal EMA during blinks to preserve natural eye closure.
+NOTE: requires 6-pt eye landmarks; disabled in MVP (detector provides 5-pt only).
 
 Motion-adaptive EMA: blend previous output warped by optical flow.
 """
@@ -23,7 +29,7 @@ class OneEuroFilter:
     One-Euro filter for a single scalar value.
 
     Recommended params for face swap transform at 30fps:
-      translation (tx/W, ty/W): min_cutoff=2.0, beta=8.0
+      translation (tx/W, ty/H): min_cutoff=2.0, beta=8.0
       scale (log):              min_cutoff=1.5, beta=4.0
       rotation (radians):       min_cutoff=2.0, beta=2.0
       d_cutoff for all: 1.0
@@ -64,7 +70,10 @@ class OneEuroFilter:
 class TransformSmoother:
     """
     Smooths similarity transform parameters using per-param One-Euro filters.
-    Parameters: tx (normalized), ty (normalized), log_scale, rotation (rad).
+    Parameters: tx (normalized by width), ty (normalized by height), log_scale, rotation (rad).
+
+    Prefer FaceParamSmoother for new code — it filters in landmark space and
+    guarantees coupling between rotation and translation.
     """
 
     def __init__(self):
@@ -76,13 +85,16 @@ class TransformSmoother:
         }
 
     def smooth(self, M: np.ndarray, frame_width: int,
+               frame_height: int | None = None,
                dt: float = 1.0 / 30.0) -> np.ndarray:
         """
         Smooth a 2×3 affine matrix M.
         Returns smoothed 2×3 affine matrix.
+        frame_height defaults to frame_width when omitted (square assumption).
         """
+        _fh = frame_height if frame_height is not None else frame_width
         tx = M[0, 2] / frame_width
-        ty = M[1, 2] / frame_width
+        ty = M[1, 2] / _fh          # Fixed: normalize by height, not width
         scale = math.sqrt(M[0, 0] ** 2 + M[0, 1] ** 2)
         rot = math.atan2(M[1, 0], M[0, 0])
 
@@ -93,7 +105,7 @@ class TransformSmoother:
 
         M_s = np.array([
             [scale_s * math.cos(rot_s), -scale_s * math.sin(rot_s), tx_s * frame_width],
-            [scale_s * math.sin(rot_s),  scale_s * math.cos(rot_s), ty_s * frame_width],
+            [scale_s * math.sin(rot_s),  scale_s * math.cos(rot_s), ty_s * _fh],
         ], dtype=np.float32)
         return M_s
 
@@ -103,7 +115,69 @@ class TransformSmoother:
 
 
 # ---------------------------------------------------------------------------
-# EAR Blink Gate
+# Face-Space Landmark Smoother (preferred over TransformSmoother)
+# ---------------------------------------------------------------------------
+
+# ArcFace 112 reference — local copy to avoid circular import with aligner.py
+_KPS_TEMPLATE_112 = np.array([
+    [38.2946, 51.6963],
+    [73.5318, 51.5014],
+    [56.0252, 71.7366],
+    [41.5493, 92.3655],
+    [70.7299, 92.2041],
+], dtype=np.float64)
+
+
+class FaceParamSmoother:
+    """
+    Filter face motion as (cx, cy, log_scale, rotation) extracted from raw
+    5-point landmarks, then reconstruct filtered landmarks.  Callers derive
+    M_swap and M_ffhq via estimate_transform(filtered_kps, size), guaranteeing
+    rotation-translation coupling across both transforms.
+    """
+
+    def __init__(self):
+        self._filters = {
+            "cx":    OneEuroFilter(min_cutoff=2.0, beta=8.0, d_cutoff=1.0),
+            "cy":    OneEuroFilter(min_cutoff=2.0, beta=8.0, d_cutoff=1.0),
+            "scale": OneEuroFilter(min_cutoff=1.5, beta=4.0, d_cutoff=1.0),
+            "rot":   OneEuroFilter(min_cutoff=2.0, beta=2.0, d_cutoff=1.0),
+        }
+        # Template: ArcFace 112 ref centered and unit-scaled on inter-eye distance.
+        # template_norm.mean() == 0, norm(template_norm[1]-template_norm[0]) == 1.
+        tmpl = _KPS_TEMPLATE_112.copy()
+        self._tmpl_ieye = float(np.linalg.norm(tmpl[1] - tmpl[0]))
+        tmpl_centered = tmpl - tmpl.mean(axis=0)
+        self._tmpl_norm = tmpl_centered / self._tmpl_ieye
+
+    def smooth(self, kps: np.ndarray, dt: float = 1.0 / 30.0) -> np.ndarray:
+        """
+        Filter 5-point landmarks and return filtered (5, 2) float32 array.
+        Pass result to estimate_transform(filtered_kps, size) for both transforms.
+        """
+        pts = np.asarray(kps, dtype=np.float64).reshape(5, 2)
+        cx, cy = pts.mean(axis=0)
+        eye_vec = pts[1] - pts[0]
+        scale = float(np.linalg.norm(eye_vec))
+        rot = float(math.atan2(eye_vec[1], eye_vec[0]))
+
+        cx_s    = self._filters["cx"](cx, dt)
+        cy_s    = self._filters["cy"](cy, dt)
+        scale_s = math.exp(self._filters["scale"](math.log(max(scale, 1e-6)), dt))
+        rot_s   = self._filters["rot"](rot, dt)
+
+        c, s = math.cos(rot_s), math.sin(rot_s)
+        R = np.array([[c, -s], [s, c]], dtype=np.float64)
+        filtered = (R @ (self._tmpl_norm.T * scale_s)).T + np.array([cx_s, cy_s])
+        return filtered.astype(np.float32)
+
+    def reset(self) -> None:
+        for f in self._filters.values():
+            f.reset()
+
+
+# ---------------------------------------------------------------------------
+# EAR Blink Gate (requires 6-pt eye landmarks; disabled in MVP)
 # ---------------------------------------------------------------------------
 
 def eye_aspect_ratio(landmarks_6: np.ndarray) -> float:

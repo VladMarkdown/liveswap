@@ -36,7 +36,7 @@ _FP32_PROVIDERS = [
 
 
 class FaceParser:
-    def __init__(self, model_path: str | Path):
+    def __init__(self, model_path: str | Path, logit_ema_alpha: float = 0.6):
         providers = [p for p in ("CUDAExecutionProvider", "DmlExecutionProvider",
                                   "CPUExecutionProvider") if p in ort.get_available_providers()]
         opts = ort.SessionOptions()
@@ -49,6 +49,12 @@ class FaceParser:
         )
         self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
+        self._logit_ema_alpha = logit_ema_alpha
+        self._prev_logits: np.ndarray | None = None
+
+    def reset(self) -> None:
+        """Reset temporal logit state (call when face is lost or subject changes)."""
+        self._prev_logits = None
 
     def parse(self, face_crop_bgr: np.ndarray) -> np.ndarray:
         """
@@ -71,6 +77,13 @@ class FaceParser:
         blob = rgb.transpose(2, 0, 1)[np.newaxis]  # (1, 3, 512, 512)
 
         logits = self._session.run([self._output_name], {self._input_name: blob})[0]
+
+        # Temporal EMA on raw logits: suppresses per-frame boundary shimmer at hair/jaw
+        if self._prev_logits is not None:
+            logits = (self._logit_ema_alpha * logits
+                      + (1.0 - self._logit_ema_alpha) * self._prev_logits)
+        self._prev_logits = logits
+
         seg = np.argmax(logits[0], axis=0).astype(np.int32)  # (512, 512)
         return seg
 

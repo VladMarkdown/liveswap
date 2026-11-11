@@ -43,14 +43,23 @@ class BudgetTests(unittest.TestCase):
         method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_should_enhance')
         scope = {}
         exec(compile(ast.Module(body=[method], type_ignores=[]), '<budget>', 'exec'), scope)
+        # _enhance_enabled is the hysteresis state; starts True (GPEN enabled by default).
         state = SimpleNamespace(_enhancer=object(), last_inference_ms=20, frame_budget_ms=33,
-                                _base_times=[18, 20], _gpen_times=[10])
+                                _base_times=[18, 20], _gpen_times=[10], _enhance_enabled=True)
         return scope['_should_enhance'], state
 
-    def test_last_frame_overrun_skips_restoration(self):
+    def test_single_overrun_does_not_disable_restoration(self):
+        # Hysteresis fix: a single spike in last_inference_ms must NOT disable GPEN.
+        # (The old hard-gate on last_inference_ms caused ~15 Hz alternating flicker.)
         check, state = self.budget_method()
-        state.last_inference_ms = 34
-        self.assertFalse(check(state, 10))
+        state.last_inference_ms = 50   # spike, but rolling avg is still fine
+        self.assertTrue(check(state, 10))  # base=19, gpen=10 → 29 < 33 → enabled
+
+    def test_rolling_overrun_disables_restoration(self):
+        # Only a sustained overrun (rolling avg > budget) disables GPEN.
+        check, state = self.budget_method()
+        state._base_times = [30, 30]   # rolling avg 30, gpen=10 → 40 > 33 → disabled
+        self.assertFalse(check(state, 15))
 
     def test_budget_recovers_without_stale_restoration(self):
         check, state = self.budget_method()

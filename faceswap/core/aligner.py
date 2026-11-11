@@ -48,6 +48,18 @@ def align_face(frame_bgr: np.ndarray, kps: np.ndarray,
     return crop, matrix
 
 
+def feather_coverage(coverage: np.ndarray,
+                     erosion_px: int = 8, transition_px: int = 16) -> np.ndarray:
+    """
+    Apply smoothstep feathering to a hard coverage mask (from warpAffine over ones).
+    Prevents hard boundary artifacts where the swap crop meets the GPEN canvas.
+    """
+    binary = (coverage > 0.5).astype(np.uint8)
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    u = np.clip((dist - erosion_px) / max(1.0, float(transition_px)), 0.0, 1.0)
+    return (u * u * (3.0 - 2.0 * u)).astype(np.float32)
+
+
 def paste_back(frame_bgr: np.ndarray, enhanced: np.ndarray,
                M: np.ndarray, mask: np.ndarray | None = None,
                return_mask: bool = False):

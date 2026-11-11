@@ -67,7 +67,15 @@ class FaceSwapper:
         import onnx
         from onnx import numpy_helper
         graph = onnx.load(model_path)
-        return numpy_helper.to_array(graph.graph.initializer[-1]).astype(np.float32)
+        # Search by shape rather than relying on ordering (fragile across re-exports).
+        for init in graph.graph.initializer:
+            arr = numpy_helper.to_array(init)
+            if arr.shape == (512, 512):
+                return arr.astype(np.float32)
+        raise ValueError(
+            "Cannot find 512×512 identity projection matrix in inswapper ONNX model; "
+            "model may be from an unsupported export."
+        )
 
     def _prepare_identity(self, face) -> np.ndarray:
         """
