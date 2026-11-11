@@ -108,7 +108,8 @@ try {
     Step 'Creating desktop shortcuts'
     $desktop = [Environment]::GetFolderPath('Desktop')
     $shell = New-Object -ComObject WScript.Shell
-    foreach ($item in @(@('liveswap', 'run.bat'), @('liveswap test', 'test.bat'))) {
+    foreach ($item in @(@('liveswap', 'run.bat'), @('liveswap test', 'test.bat'),
+                        @('liveswap record test clip', 'record.bat'))) {
         $shortcut = $shell.CreateShortcut((Join-Path $desktop ($item[0] + '.lnk')))
         $shortcut.TargetPath = Join-Path $Dir $item[1]
         $shortcut.WorkingDirectory = $Dir
@@ -120,6 +121,7 @@ try {
     Write-Host 'On the desktop:'
     Write-Host '  "liveswap"       starts the app'
     Write-Host '  "liveswap test"  runs a 30 second speed test and saves a log file to the desktop'
+    Write-Host '  "liveswap record test clip"  records 30 seconds from the webcam into C:\liveswap-test'
 } catch {
     Write-Host ''
     Write-Host "INSTALL FAILED: $($_.Exception.Message)" -ForegroundColor Red

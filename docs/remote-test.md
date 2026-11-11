@@ -28,12 +28,14 @@ If it says the models run on the CPU, also report the output of `nvidia-smi`.
 
 ## 3. Speed test
 
-Ask the person at the PC for a face photo of someone who has agreed to this,
-and for either a short video file with a face in it or permission to use the
-webcam. Then run (use `--source 0` for the webcam):
+The test files are `C:\liveswap-test\face.jpg` (source face) and
+`C:\liveswap-test\clip.mp4` (a face on video). If they are missing, ask the
+person at the PC to double-click the desktop shortcut **liveswap record test
+clip**: it records 30 seconds from the webcam and asks for a source photo.
+Everyone recorded or pictured must have agreed to this. Then run:
 
 ```powershell
-.\.venv\Scripts\python.exe tools\bench.py --photo <photo> --source <video-or-0> --seconds 30 --save out.png 2> bench-stderr.txt | Tee-Object bench.jsonl
+.\.venv\Scripts\python.exe tools\bench.py --photo C:\liveswap-test\face.jpg --source C:\liveswap-test\clip.mp4 --seconds 30 --save out.png 2> bench-stderr.txt | Tee-Object bench.jsonl
 ```
 
 Run it a second time with `--quality fast`.
