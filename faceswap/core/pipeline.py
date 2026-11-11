@@ -181,6 +181,8 @@ class SwapPipeline:
         # The swap-crop coverage mask depends only on the crop-to-crop transform,
         # which is the same for every frame; (key, mask) of the last one built.
         self._coverage_cache = None
+        # (camera frame, output frame) of the frame finished last, for recording.
+        self.last_pair = None
         if enhancer is not None:
             # The first CUDA call is far slower than steady state; keep it out
             # of the restoration budget average.
@@ -487,6 +489,7 @@ class SwapPipeline:
 
     def stage_composite(self, job: _Job) -> np.ndarray:
         if job.output is not None:
+            self.last_pair = (job.frame, job.output)
             return job.output
         started = time.perf_counter()
         timer = self._timers['composite']
@@ -525,6 +528,7 @@ class SwapPipeline:
         # WebRTC phone output — non-blocking push (Priority 5)
         if self._webrtc is not None and self._webrtc.is_active():
             self._webrtc.send_frame(full)
+        self.last_pair = (job.frame, full)
         return full
 
 

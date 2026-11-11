@@ -45,6 +45,7 @@ _DEFAULT_SETTINGS: dict = {
     "webrtc_enabled": False,
     "tensorrt": False,
     "force_restoration": False,
+    "record_session": False,
     "last_photo": "",
 }
 
@@ -681,6 +682,9 @@ class _SettingsPage(QWidget):
         ("force_restoration", "Always restore the face",
          "Sharper face on every frame, even when that lowers the frame rate. "
          "Off: restoration runs only when the graphics card keeps up."),
+        ("record_session", "Record sessions for analysis",
+         "Saves the camera image and the output side by side, with timings, to "
+         "C:\\liveswap-test while the swap runs. For testing; turn it off afterwards."),
         ("tensorrt", "TensorRT for restoration",
          "About 2.5 times faster restoration. Needs the TensorRT package; the "
          "first start builds an engine and takes about ten minutes."),
@@ -1041,6 +1045,15 @@ class MainWindow(QMainWindow):
         self._capture_end_shown = False
         self.statusBar().showMessage("Running")
 
+        # Optional recording of this session, switched on in Settings.
+        self._recorder = None
+        if self._settings.get("record_session", False):
+            try:
+                from faceswap.core.session_recorder import SessionRecorder
+                self._recorder = SessionRecorder(r"C:\liveswap-test")
+            except Exception as e:
+                self.statusBar().showMessage(f"Recording unavailable: {e}")
+
         # Virtual camera
         if self._settings.get("vcam_enabled", True):
             try:
@@ -1073,6 +1086,11 @@ class MainWindow(QMainWindow):
 
     def _deliver_frame(self, frame: np.ndarray) -> None:
         self._latest_frame = frame
+        recorder = getattr(self, "_recorder", None)
+        if recorder is not None:
+            pair = self._pipeline.last_pair if self._pipeline is not None else None
+            if pair is not None and pair[1] is frame:
+                recorder.write(pair[0], frame, self._pipeline.last_inference_ms)
         if self._vcam is not None:
             try:
                 resized = cv2.resize(frame, (1280, 720))
@@ -1089,7 +1107,8 @@ class MainWindow(QMainWindow):
                 # Stages run in parallel, so the rate is what reaches the output,
                 # not 1000 / (time spent on one frame).
                 fps = self._runner.output_fps if self._runner is not None else 0
-                self._preview_overlay.set_stats(f"{fps:.0f} fps  ·  {ms:.0f} ms")
+                recording = "REC  ·  " if getattr(self, "_recorder", None) is not None else ""
+                self._preview_overlay.set_stats(f"{recording}{fps:.0f} fps  ·  {ms:.0f} ms")
                 slowest = sorted(self._pipeline.stage_ms.items(),
                                  key=lambda item: item[1], reverse=True)[:6]
                 self._preview_overlay.set_stages(
@@ -1140,6 +1159,10 @@ class MainWindow(QMainWindow):
         if self._vcam is not None:
             self._vcam.close()
         self._vcam = None
+        recorder = getattr(self, '_recorder', None)
+        if recorder is not None:
+            recorder.close()
+            self._recorder = None
         self._runner = None
         self._pipeline = None
         self._running = False
