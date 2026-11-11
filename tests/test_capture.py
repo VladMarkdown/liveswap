@@ -18,6 +18,9 @@ class FakeCamera:
     def set(self, *args):
         return True
 
+    def get(self, prop):
+        return {3: 1280, 4: 720, 5: 30}[prop]
+
     def read(self):
         return next(self.frames, (False, None))
 
@@ -27,9 +30,10 @@ class FakeCamera:
 
 class CaptureTests(unittest.TestCase):
     def load_capture(self, camera):
-        fake = SimpleNamespace(VideoCapture=lambda source: camera,
+        fake = SimpleNamespace(VideoCapture=lambda source, backend=None: camera,
                                CAP_PROP_FRAME_WIDTH=3, CAP_PROP_FRAME_HEIGHT=4,
-                               CAP_PROP_FPS=5)
+                               CAP_PROP_FPS=5, CAP_PROP_FOURCC=6, CAP_PROP_BUFFERSIZE=38,
+                               CAP_DSHOW=700, VideoWriter_fourcc=lambda *chars: 0)
         spec = importlib.util.spec_from_file_location(
             'capture_under_test', Path(__file__).parents[1] / 'faceswap/camera/capture.py')
         module = importlib.util.module_from_spec(spec)

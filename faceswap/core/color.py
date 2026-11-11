@@ -40,11 +40,28 @@ def _get_pore_tile(size: int = 256) -> np.ndarray:
     return _PORE_TILE
 
 
-# Jimenez separable SSS skin profile: (weight, sigma_normalized)
+# Sum-of-Gaussians skin diffusion profile (d'Eon & Luebke, GPU Gems 3):
+# (variance in mm², (R, G, B) weights). Each channel's weights sum to 1.
 _SSS_PROFILE = [
-    (0.233, 0.0064), (0.100, 0.0484), (0.118, 0.1870),
-    (0.113, 0.5670), (0.358, 1.9900), (0.078, 7.4100),
+    (0.0064, (0.233, 0.455, 0.649)),
+    (0.0484, (0.100, 0.336, 0.344)),
+    (0.1870, (0.118, 0.198, 0.000)),
+    (0.5670, (0.113, 0.007, 0.007)),
+    (1.9900, (0.358, 0.004, 0.000)),
+    (7.4100, (0.078, 0.000, 0.000)),
 ]
+# An FFHQ-512 crop puts the eyes ~126 px apart; at a ~63 mm interpupillary
+# distance that is 2 px per mm, i.e. crop_width / 256.
+_SSS_CROP_WIDTH_MM = 256.0
+
+# sRGB-ish gamma 2.2 decode table for uint8 input.
+_TO_LINEAR = ((np.arange(256, dtype=np.float32) / 255.0) ** 2.2).astype(np.float32)
+
+
+def _to_gamma_u8(linear: np.ndarray) -> np.ndarray:
+    """Linear float32 [0, 1] -> gamma-encoded uint8."""
+    encoded = cv2.pow(np.clip(linear, 0.0, 1.0), 1.0 / 2.2)
+    return np.clip(encoded * 255.0, 0, 255).astype(np.uint8)
 
 
 def reinhard_color_transfer(source: np.ndarray, target: np.ndarray,
@@ -87,19 +104,27 @@ def low_freq_shading_correction(swapped: np.ndarray, target: np.ndarray,
     When skin_mask is provided the correction is blended in only within that region.
     """
     # Linearize: shading is a linear-light phenomenon
-    sw_lin = (swapped.astype(np.float32) / 255.0) ** 2.2
-    tg_lin = (target.astype(np.float32)  / 255.0) ** 2.2
+    sw_lin = _TO_LINEAR[swapped]
+    tg_lin = _TO_LINEAR[target]
 
-    sw_low = gaussian_filter(sw_lin, sigma=[sigma, sigma, 0])
-    tg_low = gaussian_filter(tg_lin, sigma=[sigma, sigma, 0])
+    # The shading field is low-frequency by construction, so estimate it on a
+    # small image: area-downsample, blur with the scaled sigma, upsample the ratio.
+    h, w = swapped.shape[:2]
+    factor = max(1, int(sigma // 2.5))
+    small = (max(1, w // factor), max(1, h // factor))
+    small_sigma = sigma / factor
+    sw_low = cv2.GaussianBlur(cv2.resize(sw_lin, small, interpolation=cv2.INTER_AREA),
+                              (0, 0), small_sigma)
+    tg_low = cv2.GaussianBlur(cv2.resize(tg_lin, small, interpolation=cv2.INTER_AREA),
+                              (0, 0), small_sigma)
 
     # Multiplicative ratio; partial 0.7 and clamp prevent extreme corrections
     ratio = tg_low / (sw_low + 1e-6)
     ratio = np.clip(1.0 + (ratio - 1.0) * 0.7, 0.3, 3.0)
-    result_lin = sw_lin * ratio
+    result_lin = sw_lin * cv2.resize(ratio, (w, h), interpolation=cv2.INTER_LINEAR)
 
     # Back to gamma
-    result = np.clip(np.maximum(result_lin, 0.0) ** (1.0 / 2.2) * 255.0, 0, 255).astype(np.uint8)
+    result = _to_gamma_u8(result_lin)
 
     if skin_mask is not None:
         # Blend corrected result into original only within skin region
@@ -161,40 +186,29 @@ def inject_skin_detail(swapped: np.ndarray, target_registered: np.ndarray,
 def apply_sss(face_bgr: np.ndarray, skin_mask: np.ndarray,
               strength: float = 0.20) -> np.ndarray:
     """
-    Jimenez separable SSS approximation.
-    Removes "plastic" skin look. R scatters 2mm, G ~1mm, B ~0.3mm.
-    Linearizes input (gamma→linear) before blurring for physically correct scatter,
-    and uses scipy gaussian_filter to handle all sigma values without kernel cap.
+    Sum-of-Gaussians SSS approximation.
+    Removes "plastic" skin look: red scatters furthest, blue barely at all.
+    Linearizes input (gamma→linear) before blurring for physically correct scatter.
+    The profile is in millimetres; sigma = sqrt(variance) scaled to crop pixels.
     """
-    h, w = face_bgr.shape[:2]
+    w = face_bgr.shape[1]
+    px_per_mm = w / _SSS_CROP_WIDTH_MM
     # Linearize: SSS is a linear-light phenomenon
-    face_f = (face_bgr.astype(np.float32) / 255.0) ** 2.2
-    channel_scale = [0.3, 0.6, 1.0]  # B, G, R
-    sss_channels = []
+    face_f = _TO_LINEAR[face_bgr]
+    sss_result = np.zeros_like(face_f)
 
-    for ch in range(3):
-        ch_layer = face_f[..., ch]
-        sss_layer = np.zeros((h, w), dtype=np.float32)
-        for weight, sigma_norm in _SSS_PROFILE:
-            sigma_px = sigma_norm * w * 0.5 * channel_scale[ch]
-            if sigma_px < 0.5:
-                sss_layer += weight * ch_layer
-                continue
-            # scipy gaussian_filter auto-sizes the kernel — no ksize cap that
-            # caused box-filter artefacts on the long-range scatter lobes.
-            blurred = gaussian_filter(ch_layer, sigma_px)
-            sss_layer += weight * blurred
-        sss_channels.append(sss_layer)
+    for variance_mm2, (wr, wg, wb) in _SSS_PROFILE:
+        sigma_px = float(np.sqrt(variance_mm2)) * px_per_mm
+        # Below half a pixel the lobe is narrower than the sampling grid.
+        layer = face_f if sigma_px < 0.5 else cv2.GaussianBlur(face_f, (0, 0), sigma_px)
+        sss_result += layer * np.array([wb, wg, wr], dtype=np.float32)
 
-    sss_result = np.stack(sss_channels, axis=-1)
     mask_3ch = cv2.GaussianBlur(
-        np.stack([skin_mask] * 3, axis=-1).astype(np.float32) / 255.0,
-        (11, 11), 3.0
-    )
+        skin_mask.astype(np.float32) / 255.0, (11, 11), 3.0
+    )[..., np.newaxis]
     out_lin = face_f + strength * mask_3ch * (sss_result - face_f)
     # Delinearize back to gamma
-    out = np.clip(np.maximum(out_lin, 0.0) ** (1.0 / 2.2) * 255.0, 0, 255)
-    return out.astype(np.uint8)
+    return _to_gamma_u8(out_lin)
 
 
 def apply_micro_texture(face_bgr: np.ndarray, skin_mask: np.ndarray,
@@ -418,12 +432,13 @@ def pct_harmonize(swapped: np.ndarray, target: np.ndarray,
     sa, sha = _up(scale_a), _up(shift_a)
     sb, shb = _up(scale_b), _up(shift_b)
 
-    # Apply spatially-varying transform in Lab space
+    # Apply spatially-varying transform in Lab space.
+    # OpenCV's uint8 Lab stores L, a and b all in 0..255 (a/b offset by 128).
     sw_full_lab = cv2.cvtColor(swapped, cv2.COLOR_BGR2Lab).astype(np.float32)
     out = sw_full_lab.copy()
-    out[..., 0] = np.clip(sw_full_lab[..., 0] + sL, 0, 100)
-    out[..., 1] = np.clip(sw_full_lab[..., 1] * sa + sha, -128, 127)
-    out[..., 2] = np.clip(sw_full_lab[..., 2] * sb + shb, -128, 127)
+    out[..., 0] = np.clip(sw_full_lab[..., 0] + sL, 0, 255)
+    out[..., 1] = np.clip(sw_full_lab[..., 1] * sa + sha, 0, 255)
+    out[..., 2] = np.clip(sw_full_lab[..., 2] * sb + shb, 0, 255)
 
     result = cv2.cvtColor(out.astype(np.uint8), cv2.COLOR_Lab2BGR)
 

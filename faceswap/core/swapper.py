@@ -10,16 +10,10 @@ AlphaFace / HyperSwap CANNOT use TRT FP16 — documented precision loss (ORT iss
 Use CUDAExecutionProvider FP32 for swap model.
 """
 from __future__ import annotations
-import cv2
 import numpy as np
-import onnxruntime as ort
 from pathlib import Path
 
-
-def _fp32_providers():
-    available = ort.get_available_providers()
-    return [name for name in ("CUDAExecutionProvider", "DmlExecutionProvider",
-                              "CPUExecutionProvider") if name in available]
+from .ort_utils import create_session
 
 
 class FaceSwapper:
@@ -34,21 +28,7 @@ class FaceSwapper:
                                "hyperswap_1b", "hyperswap_1c", "inswapper"):
             raise ValueError(f"Unsupported swap model type: {model_type}")
         self._model_type = model_type
-        opts = ort.SessionOptions()
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        providers = _fp32_providers()
-        if "DmlExecutionProvider" in providers:
-            opts.enable_mem_pattern = False
-            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        while providers:
-            try:
-                self._session = ort.InferenceSession(
-                    str(model_path), sess_options=opts, providers=providers)
-                break
-            except Exception:
-                if len(providers) == 1:
-                    raise
-                providers = providers[1:]
+        self._session = create_session(model_path)
         inputs = self._session.get_inputs()
         images = [item for item in inputs if len(item.shape) == 4 and item.shape[1] == 3]
         identities = [item for item in inputs if len(item.shape) == 2 and item.shape[-1] == 512]
@@ -102,13 +82,13 @@ class FaceSwapper:
         Swap source identity onto target_crop.
 
         Args:
-            target_crop:  aligned face crop, HWC BGR uint8.
+            target_crop:  ArcFace-aligned face crop, HWC BGR uint8.
                           256×256 normally; 512×512 when pixel_boost=True.
             source_face:  InsightFace face object from source image
-            pixel_boost:  when True and model input is 256px, tiles the 512
-                          crop into 4 overlapping 256 patches, runs the swap
-                          on each, and blends results back to 512×512 for
-                          higher-detail output.
+            pixel_boost:  when True and model input is 256px, splits the 512
+                          crop into 4 pixel-interleaved 256 sub-images (each
+                          still a whole aligned face), swaps each, and
+                          re-interleaves them into a 512×512 output.
         Returns:
             swapped crop: HWC BGR uint8 (same spatial size as target_crop
                           when pixel_boost=False; always 512×512 when True)
@@ -146,38 +126,17 @@ class FaceSwapper:
 
     def _swap_pixel_boost(self, crop_512: np.ndarray, source_face) -> np.ndarray:
         """
-        Pixel-boost: tile 512×512 input into 4 overlapping 256×256 patches,
-        swap each independently, blend back with averaged overlap zones.
+        Pixel-boost: split the 512×512 crop into 4 pixel-interleaved 256×256
+        sub-images (every second pixel, at each of the 2×2 offsets). Each
+        sub-image is a whole aligned face, which is what the model expects;
+        spatial quadrants are not. Swap each and re-interleave.
         Returns 512×512 BGR uint8.
         """
-        overlap = 32  # px overlap per side
-        result = np.zeros((512, 512, 3), dtype=np.float32)
-        weight = np.zeros((512, 512, 1), dtype=np.float32)
-
-        # Patch top-left corners: 0,0 / 256,0 / 0,256 / 256,256 (all with overlap)
-        for oy, ox in [(0, 0), (0, 256), (256, 0), (256, 256)]:
-            # Extract 256+overlap patch, clamp to image boundary
-            y0 = max(0, oy - overlap)
-            x0 = max(0, ox - overlap)
-            y1 = min(512, oy + 256 + overlap)
-            x1 = min(512, ox + 256 + overlap)
-            patch = crop_512[y0:y1, x0:x1]
-            # Resize to exactly 256×256 for the model
-            patch_256 = cv2.resize(patch, (256, 256))
-            swapped_256 = self._swap_single(patch_256, source_face)
-            # Resize back to original patch size
-            swapped_patch = cv2.resize(swapped_256, (x1 - x0, y1 - y0))
-            # Build feathered weight: 1 in center, falls to 0 at edges
-            ph, pw = swapped_patch.shape[:2]
-            wx = np.minimum(np.arange(pw, dtype=np.float32) + 1,
-                            np.arange(pw, 0, -1, dtype=np.float32))
-            wy = np.minimum(np.arange(ph, dtype=np.float32) + 1,
-                            np.arange(ph, 0, -1, dtype=np.float32))
-            w2d = np.minimum(wx[np.newaxis, :], wy[:, np.newaxis])
-            w2d = w2d / (w2d.max() + 1e-6)
-            w3d = w2d[..., np.newaxis]
-            result[y0:y1, x0:x1] += swapped_patch.astype(np.float32) * w3d
-            weight[y0:y1, x0:x1] += w3d
-
-        result /= np.maximum(weight, 1e-6)
-        return np.clip(result, 0, 255).astype(np.uint8)
+        if crop_512.shape[:2] != (512, 512):
+            raise ValueError("Pixel boost needs a 512×512 crop")
+        result = np.empty_like(crop_512)
+        for dy in (0, 1):
+            for dx in (0, 1):
+                sub = np.ascontiguousarray(crop_512[dy::2, dx::2])
+                result[dy::2, dx::2] = self._swap_single(sub, source_face)
+        return result

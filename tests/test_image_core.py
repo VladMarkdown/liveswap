@@ -51,15 +51,107 @@ class ImageCoreTests(unittest.TestCase):
                         SimpleNamespace(name='pixels', shape=[1, 3, 256, 256])]
             def get_outputs(self):
                 return [SimpleNamespace(name='output')]
+            def get_providers(self):
+                return ['CPUExecutionProvider']
             def run(self, names, values):
                 feed.update(values)
                 return [np.zeros((1, 3, 256, 256), np.float32)]
-        with patch('faceswap.core.swapper.ort.InferenceSession', return_value=Session()):
+        with patch('faceswap.core.ort_utils.ort.InferenceSession', return_value=Session()):
             swapper = FaceSwapper('fake.onnx', 'hyperswap')
         face = SimpleNamespace(normed_embedding=np.ones(512, np.float32) / np.sqrt(512))
         out = swapper.swap(np.zeros((256, 256, 3), np.uint8), face)
         np.testing.assert_array_equal(feed['pixels'], -np.ones((1, 3, 256, 256)))
         self.assertEqual(int(out[0, 0, 0]), 127)
+
+    def test_pixel_boost_feeds_whole_face_subimages_and_reinterleaves(self):
+        seen = []
+        swapper = FaceSwapper.__new__(FaceSwapper)
+        swapper._image_shape = [1, 3, 256, 256]
+        def swap_single(crop, face):
+            seen.append(crop.shape)
+            return crop
+        swapper._swap_single = swap_single
+        crop = np.random.default_rng(0).integers(0, 255, (512, 512, 3), dtype=np.uint8)
+        out = swapper.swap(crop, None, pixel_boost=True)
+        self.assertEqual(seen, [(256, 256, 3)] * 4)
+        np.testing.assert_array_equal(out, crop)
+
+    def run_pipeline(self, detections, **options):
+        """Drive SwapPipeline.process_frame with fake models; returns (outputs, enhancer calls)."""
+        from faceswap.core import pipeline as pipeline_module
+        from faceswap.core.parser import FaceParser
+
+        class Swapper:
+            def swap(self, crop, face, pixel_boost=False):
+                return 255 - crop
+
+        class Enhancer:
+            calls = 0
+            def enhance(self, crop):
+                return crop
+            def enhance_with_blend(self, crop, blend=0.8):
+                Enhancer.calls += 1
+                return crop
+
+        class Session:
+            def run(self, names, feed):
+                logits = np.zeros((1, 19, 512, 512), np.float32)
+                logits[0, 1, 128:384, 128:384] = 5   # a square of skin
+                return [logits]
+
+        parser = FaceParser.__new__(FaceParser)
+        parser._session, parser._input_name, parser._output_name = Session(), 'in', 'out'
+        parser._logit_ema_alpha, parser._prev_logits = 0.6, None
+
+        pipe = pipeline_module.SwapPipeline(Swapper(), Enhancer(), parser, **options)
+        pipe.set_source_face(object())
+        frame = np.random.default_rng(0).integers(0, 255, (720, 1280, 3), dtype=np.uint8)
+        queue = iter(detections)
+        with patch.object(pipeline_module, 'detect_tracked', lambda frame, prev: next(queue)):
+            outputs = [pipe.process_frame(frame) for _ in detections]
+        return frame, outputs, Enhancer.calls
+
+    def fake_face(self):
+        kps = aligner._ARCFACE_REF_112 * 3 + [450, 150]
+        landmarks = np.zeros((106, 2), np.float32)
+        return SimpleNamespace(kps=kps, bbox=np.array([480., 180., 800., 560.]),
+                               landmark_2d_106=landmarks)
+
+    def test_process_frame_runs_end_to_end_with_and_without_pixel_boost(self):
+        for boost in (False, True):
+            frame, outputs, _ = self.run_pipeline(
+                [self.fake_face()] * 3, pixel_boost=boost, use_pct=True, use_occluder=True)
+            self.assertEqual(outputs[-1].shape, frame.shape)
+            self.assertFalse(np.array_equal(outputs[-1], frame))
+            np.testing.assert_array_equal(outputs[-1][:50], frame[:50])
+
+    def test_brief_detection_dropout_keeps_swapping_then_gives_up(self):
+        face = self.fake_face()
+        frame, outputs, _ = self.run_pipeline([face] + [None] * 6, quality='fast')
+        for held in outputs[1:6]:
+            self.assertFalse(np.array_equal(held, frame))
+        np.testing.assert_array_equal(outputs[6], frame)
+
+    def test_pct_harmonize_keeps_matching_bright_face_unchanged(self):
+        face = np.full((512, 512, 3), 220, np.uint8)
+        face[..., 2] = 240
+        mask = np.full((512, 512), 255, np.uint8)
+        out = color.pct_harmonize(face, face.copy(), mask)
+        np.testing.assert_allclose(out, face, atol=2)
+
+    def test_shading_correction_matches_target_brightness(self):
+        swapped = np.full((512, 512, 3), 100, np.uint8)
+        target = np.full((512, 512, 3), 140, np.uint8)
+        out = color.low_freq_shading_correction(swapped, target, sigma=20.0)
+        self.assertGreater(int(out[256, 256, 0]), 120)
+        self.assertLess(int(out[256, 256, 0]), 140)
+
+    def test_sss_blur_radius_stays_a_few_pixels_at_512(self):
+        face = np.zeros((512, 512, 3), np.uint8)
+        face[256, 256] = 255
+        out = color.apply_sss(face, np.full((512, 512), 255, np.uint8), strength=1)
+        self.assertGreater(int(out[256, 256, 2]), 0)
+        self.assertEqual(int(out[256, 300, 2]), 0)
 
     def test_uint8_detail_matches_linear_calculation(self):
         rng = np.random.default_rng(1)

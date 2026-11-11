@@ -302,7 +302,7 @@ class _SettingsDialog(QDialog):
         self._adv_box = QGroupBox()
         self._adv_box.hide()
         adv_inner = QVBoxLayout(self._adv_box)
-        self._pixel_boost_cb = QCheckBox("Pixel boost (4× patch tiling, slower)")
+        self._pixel_boost_cb = QCheckBox("Pixel boost (4 swap passes at 512px, slower)")
         self._pixel_boost_cb.setChecked(self._s.get("pixel_boost", False))
         self._pct_cb = QCheckBox("PCT color harmonization (better lighting match)")
         self._pct_cb.setChecked(self._s.get("pct_harmonize", False))
@@ -775,14 +775,12 @@ class MainWindow(QMainWindow):
 
     def _load_models(self) -> None:
         from faceswap.core.swapper  import FaceSwapper
-        from faceswap.core.enhancer import GPENEnhancer
-        from faceswap.core.parser   import BiSeNetParser
-        import onnxruntime as ort
+        from faceswap.core.enhancer import FaceEnhancer
+        from faceswap.core.parser   import FaceParser
 
-        providers = ort.get_available_providers()
         self._swapper  = FaceSwapper("models/alphaface_256.onnx",  model_type="alphaface")
-        self._enhancer = GPENEnhancer("models/GPEN-BFR-512.onnx")
-        self._parser   = BiSeNetParser("models/bisenet.onnx")
+        self._enhancer = FaceEnhancer("models/GPEN-BFR-512.onnx")
+        self._parser   = FaceParser("models/bisenet.onnx")
 
     def _start_pipeline(self) -> None:
         # NOTE: threading, gc, load_profile_by_name, generate_profile_source_face,

@@ -26,7 +26,7 @@ Upload 5-10 photos → 15 min personalization → 9.5/10 photorealistic quality
 - Profile: Arc2Face + LoRA fine-tuning
 - Virtual camera: softcam (DirectShow, MIT license)
 - GUI: PySide6
-- Inference: ONNX Runtime + TensorRT FP16
+- Inference: ONNX Runtime FP32 (CUDA, DirectML or CPU). TensorRT is not wired up yet.
 
 ## Install
 

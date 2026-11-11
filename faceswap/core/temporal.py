@@ -150,19 +150,31 @@ class FaceParamSmoother:
         tmpl_centered = tmpl - tmpl.mean(axis=0)
         self._tmpl_norm = tmpl_centered / self._tmpl_ieye
 
-    def smooth(self, kps: np.ndarray, dt: float = 1.0 / 30.0) -> np.ndarray:
+    def smooth(self, kps: np.ndarray, dt: float = 1.0 / 30.0,
+               frame_size: tuple[int, int] = (1, 1)) -> np.ndarray:
         """
         Filter 5-point landmarks and return filtered (5, 2) float32 array.
         Pass result to estimate_transform(filtered_kps, size) for both transforms.
+
+        frame_size is (width, height). The translation filters are tuned for
+        coordinates normalized by it; in raw pixels their beta term opens the
+        cutoff on sub-pixel jitter and nothing is smoothed.
         """
         pts = np.asarray(kps, dtype=np.float64).reshape(5, 2)
         cx, cy = pts.mean(axis=0)
-        eye_vec = pts[1] - pts[0]
-        scale = float(np.linalg.norm(eye_vec))
-        rot = float(math.atan2(eye_vec[1], eye_vec[0]))
+        # Least-squares similarity from the centered template to all five
+        # points. Eye distance alone shrinks under yaw and mis-scales the crop.
+        centered = pts - (cx, cy)
+        tmpl = self._tmpl_norm
+        denom = float((tmpl ** 2).sum())
+        a = float((tmpl * centered).sum()) / denom
+        b = float((tmpl[:, 0] * centered[:, 1] - tmpl[:, 1] * centered[:, 0]).sum()) / denom
+        scale = math.hypot(a, b)
+        rot = math.atan2(b, a)
 
-        cx_s    = self._filters["cx"](cx, dt)
-        cy_s    = self._filters["cy"](cy, dt)
+        width, height = frame_size
+        cx_s    = self._filters["cx"](cx / width, dt) * width
+        cy_s    = self._filters["cy"](cy / height, dt) * height
         scale_s = math.exp(self._filters["scale"](math.log(max(scale, 1e-6)), dt))
         rot_s   = self._filters["rot"](rot, dt)
 
@@ -180,18 +192,25 @@ class FaceParamSmoother:
 # EAR Blink Gate (requires 6-pt eye landmarks; disabled in MVP)
 # ---------------------------------------------------------------------------
 
-def eye_aspect_ratio(landmarks_6: np.ndarray) -> float:
+def eye_aspect_ratio(eye_points: np.ndarray) -> float:
     """
-    Compute EAR for one eye from 6 ordered eye landmarks.
-    landmarks_6: (6, 2) array — left corner, top-left, top-right, right corner, bottom-right, bottom-left
+    Eye opening as height / width of the eye contour, independent of point order.
+    eye_points: (N, 2) contour points of one eye, N >= 3.
+    Width is the largest distance between two points (the eye corners); height
+    is the extent of all points perpendicular to that corner-to-corner axis.
     closed: ear < 0.60 × median_open_ear
     reopened: ear > 0.75 × median_open_ear
     """
-    p = landmarks_6
-    h1 = np.linalg.norm(p[1] - p[5])
-    h2 = np.linalg.norm(p[2] - p[4])
-    w  = np.linalg.norm(p[0] - p[3])
-    return (h1 + h2) / (2.0 * max(w, 1e-6))
+    p = np.asarray(eye_points, dtype=np.float64)
+    diffs = p[:, None, :] - p[None, :, :]
+    dists = np.linalg.norm(diffs, axis=2)
+    i, j = np.unravel_index(np.argmax(dists), dists.shape)
+    width = dists[i, j]
+    if width < 1e-6:
+        return 0.0
+    axis = diffs[i, j] / width
+    across = p @ np.array([-axis[1], axis[0]])
+    return float((across.max() - across.min()) / width)
 
 
 class BlinkGate:
@@ -251,6 +270,29 @@ class TemporalEMA:
         self._motion_threshold = motion_threshold
         self._prev_frame: np.ndarray | None = None
         self._prev_gray: np.ndarray | None = None
+        self._flow_cache = None  # (gray, roi, flow) for the current frame
+
+    def _face_flow(self, gray: np.ndarray, face_bbox):
+        """Current -> previous Farneback flow over the padded face box.
+
+        Returns (roi, flow), or (None, None) for an empty box. Cached per frame
+        so get_face_flow() and blend() share one optical-flow computation.
+        """
+        if self._flow_cache is not None and self._flow_cache[0] is gray:
+            return self._flow_cache[1], self._flow_cache[2]
+        h, w = gray.shape
+        x1, y1 = max(0, int(face_bbox[0]) - 16), max(0, int(face_bbox[1]) - 16)
+        x2, y2 = min(w, int(face_bbox[2]) + 16), min(h, int(face_bbox[3]) + 16)
+        if x2 <= x1 or y2 <= y1:
+            return None, None
+        roi = np.s_[y1:y2, x1:x2]
+        # Remap needs current -> previous flow, not forward flow.
+        flow = cv2.calcOpticalFlowFarneback(
+            gray[roi], self._prev_gray[roi], None,
+            pyr_scale=0.5, levels=2, winsize=15,
+            iterations=2, poly_n=5, poly_sigma=1.1, flags=0)
+        self._flow_cache = (gray, roi, flow)
+        return roi, flow
 
     def blend(self, current: np.ndarray, gray: np.ndarray,
               face_bbox, is_blinking: bool = False,
@@ -270,17 +312,9 @@ class TemporalEMA:
             face_mask[y1:y2, x1:x2] = 1
         else:
             face_mask = np.clip(face_mask, 0, 1)
-        ys, xs = np.nonzero(face_mask > 0)
         result = current.copy()
-        if xs.size:
-            x1, x2 = max(0, int(xs.min()) - 8), min(w, int(xs.max()) + 9)
-            y1, y2 = max(0, int(ys.min()) - 8), min(h, int(ys.max()) + 9)
-            roi = np.s_[y1:y2, x1:x2]
-            # Remap needs current -> previous flow, not forward flow.
-            flow = cv2.calcOpticalFlowFarneback(
-                gray[roi], self._prev_gray[roi], None,
-                pyr_scale=0.5, levels=2, winsize=15,
-                iterations=2, poly_n=5, poly_sigma=1.1, flags=0)
+        roi, flow = self._face_flow(gray, face_bbox)
+        if roi is not None:
             rh, rw = gray[roi].shape
             xx, yy = np.meshgrid(np.arange(rw, dtype=np.float32),
                                  np.arange(rh, dtype=np.float32))
@@ -309,17 +343,12 @@ class TemporalEMA:
         Returns zero vector if no history or bbox is degenerate."""
         if self._prev_gray is None or self._prev_gray.shape != current_gray.shape:
             return np.zeros(2, dtype=np.float32)
-        h, w = current_gray.shape
-        x1, y1 = max(0, int(face_bbox[0])), max(0, int(face_bbox[1]))
-        x2, y2 = min(w, int(face_bbox[2])), min(h, int(face_bbox[3]))
-        if x2 <= x1 or y2 <= y1:
+        _, flow = self._face_flow(current_gray, face_bbox)
+        if flow is None:
             return np.zeros(2, dtype=np.float32)
-        flow = cv2.calcOpticalFlowFarneback(
-            current_gray[y1:y2, x1:x2], self._prev_gray[y1:y2, x1:x2], None,
-            pyr_scale=0.5, levels=2, winsize=15,
-            iterations=2, poly_n=5, poly_sigma=1.1, flags=0)
         return np.median(flow.reshape(-1, 2), axis=0).astype(np.float32)
 
     def reset(self) -> None:
         self._prev_frame = None
         self._prev_gray = None
+        self._flow_cache = None

@@ -1,11 +1,15 @@
 """Background OpenCV capture with a latest-frame mailbox."""
 from __future__ import annotations
 
+import logging
 import queue
+import sys
 import threading
 import time
 
 import cv2
+
+logger = logging.getLogger(__name__)
 
 
 class CaptureThread:
@@ -30,14 +34,31 @@ class CaptureThread:
         self.dropped_frames = 0
         while not self._frames.empty():
             self._frames.get_nowait()
-        self._cap = cv2.VideoCapture(self.source)
+        local_windows_camera = isinstance(self.source, int) and sys.platform == "win32"
+        if local_windows_camera:
+            # DirectShow opens faster than the default MSMF backend and honours
+            # the MJPG request below.
+            self._cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+        else:
+            self._cap = cv2.VideoCapture(self.source)
         if not self._cap.isOpened():
             self._cap.release()
             self._cap = None
             raise RuntimeError(f"Cannot open camera {self.source}")
+        if local_windows_camera:
+            # Uncompressed YUY2 over USB 2 caps many webcams near 10 fps at 720p.
+            # The codec must be requested before the frame size.
+            self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._cap.set(cv2.CAP_PROP_FPS, self.requested_fps)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        actual = (int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                  int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                  self._cap.get(cv2.CAP_PROP_FPS))
+        if actual[:2] != (self.width, self.height) or actual[2] < self.requested_fps - 1:
+            logger.warning("Camera %s delivers %dx%d @ %.0f fps, not the requested %dx%d @ %d",
+                           self.source, *actual, self.width, self.height, self.requested_fps)
         self._thread = threading.Thread(target=self._capture, daemon=True)
         self._thread.start()
         return self

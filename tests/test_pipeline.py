@@ -15,6 +15,22 @@ def load_def(name):
     return scope[name]
 
 
+class FitFrameTests(unittest.TestCase):
+    def test_four_by_three_is_cropped_not_stretched(self):
+        import numpy as np
+        import cv2
+        fit = load_def('fit_frame')
+        fit.__globals__.update(cv2=cv2, np=np)
+        frame = np.zeros((480, 640, 3), np.uint8)
+        frame[:, 320:] = 255          # vertical edge at the horizontal centre
+        frame[:60] = 99               # top band that a 16:9 crop removes
+        out = fit(frame, 1280, 720)
+        self.assertEqual(out.shape, (720, 1280, 3))
+        self.assertNotIn(99, out)
+        self.assertEqual(int(out[360, 100, 0]), 0)
+        self.assertEqual(int(out[360, 1180, 0]), 255)
+
+
 class StageTimerTests(unittest.TestCase):
     def test_marks_split_elapsed_time_by_stage(self):
         from collections import deque

@@ -54,22 +54,52 @@ def detect_largest(frame_bgr: np.ndarray):
     return faces[0] if faces else None
 
 
-def get_eye_landmarks_6pt(face) -> tuple:
-    """
-    Extract 6-point eye landmarks for EAR from buffalo_l's 2d106det output.
-    Returns (left_6, right_6) each (6, 2) float32, or (None, None) if unavailable.
+def _area(bbox) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
 
-    buffalo_l 2d106det eye indices (InsightFace convention):
-      Left eye:  60 (l-corner), 61, 63, 64 (r-corner), 65, 67
-      Right eye: 68 (l-corner), 69, 71, 72 (r-corner), 73, 75
-    Landmark order matches eye_aspect_ratio:
-      [l-corner, top-left, top-right, r-corner, bottom-right, bottom-left]
+
+def _iou(a, b) -> float:
+    inter = _area((max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])))
+    return inter / max(_area(a) + _area(b) - inter, 1e-6)
+
+
+def detect_tracked(frame_bgr: np.ndarray, prev_bbox=None):
+    """
+    Live-path detection: SCRFD plus the 106-point landmarks for one face only.
+
+    Skips the recognition, gender/age and 3D-landmark models that
+    FaceAnalysis.get() runs on every face; the live target needs none of them.
+    Follows the face that overlaps prev_bbox (so a second, similarly sized face
+    cannot steal the swap); otherwise picks the largest. Returns a Face with
+    .bbox, .kps and .landmark_2d_106, or None.
+    """
+    from insightface.app.common import Face
+    with _app_lock:
+        app = _get_app()
+        bboxes, kpss = app.det_model.detect(frame_bgr, max_num=0, metric='default')
+        if bboxes.shape[0] == 0:
+            return None
+        index = int(np.argmax([_area(b) for b in bboxes]))
+        if prev_bbox is not None:
+            overlaps = [_iou(b, prev_bbox) for b in bboxes]
+            if max(overlaps) > 0.3:
+                index = int(np.argmax(overlaps))
+        face = Face(bbox=bboxes[index, :4], kps=kpss[index], det_score=bboxes[index, 4])
+        landmarks = app.models.get('landmark_2d_106')
+        if landmarks is not None:
+            landmarks.get(frame_bgr, face)
+    return face
+
+
+def get_eye_landmarks(face) -> tuple:
+    """
+    Eye contour points for the blink gate from buffalo_l's 2d106det output.
+    Returns (left, right), each (10, 2) float32, or (None, None) if unavailable.
+
+    In the 106-point layout the eyes are 33-42 and 87-96; 52-71 is the mouth.
+    The order within each eye is not relied on (see eye_aspect_ratio).
     """
     lm = getattr(face, 'landmark_2d_106', None)
     if lm is None or len(lm) < 106:
         return None, None
-    try:
-        return (lm[[60, 61, 63, 64, 65, 67]].astype(np.float32),
-                lm[[68, 69, 71, 72, 73, 75]].astype(np.float32))
-    except (IndexError, TypeError):
-        return None, None
+    return lm[33:43].astype(np.float32), lm[87:97].astype(np.float32)

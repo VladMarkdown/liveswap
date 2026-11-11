@@ -9,12 +9,14 @@ Two backends:
   2. BiSeNet heuristic fallback — no extra model needed
 """
 from __future__ import annotations
+import logging
 from pathlib import Path
 from threading import RLock
 
 import cv2
 import numpy as np
 
+logger = logging.getLogger(__name__)
 _OCCLUDER_MODEL = Path("models/occluder.onnx")
 _session = None
 _session_lock = RLock()
@@ -30,11 +32,10 @@ def _try_load_session():
             _session = "unavailable"
             return _session
         try:
-            import onnxruntime as ort
-            opts = ort.SessionOptions()
-            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            _session = ort.InferenceSession(str(_OCCLUDER_MODEL), sess_options=opts)
+            from .ort_utils import create_session
+            _session = create_session(_OCCLUDER_MODEL)
         except Exception:
+            logger.exception("Occluder model failed to load; using the heuristic")
             _session = "unavailable"
         return _session
 

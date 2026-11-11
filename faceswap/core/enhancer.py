@@ -11,8 +11,9 @@ GPEN can use TRT FP16 safely. SCRFD also. AlphaFace/BiSeNet: CUDA FP32 only.
 """
 from __future__ import annotations
 import numpy as np
-import onnxruntime as ort
 from pathlib import Path
+
+from .ort_utils import create_session
 
 
 class FaceEnhancer:
@@ -22,16 +23,7 @@ class FaceEnhancer:
     """
 
     def __init__(self, model_path: str | Path, gpu_vendor: str = "nvidia"):
-        providers = [p for p in ("CUDAExecutionProvider", "DmlExecutionProvider",
-                                  "CPUExecutionProvider") if p in ort.get_available_providers()]
-        opts = ort.SessionOptions()
-        if "DmlExecutionProvider" in providers:
-            opts.enable_mem_pattern = False
-            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self._session = ort.InferenceSession(
-            str(model_path), sess_options=opts, providers=providers
-        )
+        self._session = create_session(model_path)
         self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
 

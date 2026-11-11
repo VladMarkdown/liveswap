@@ -11,7 +11,7 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from .detector import detect_largest, get_eye_landmarks_6pt
+from .detector import detect_tracked, get_eye_landmarks
 from .aligner import estimate_transform, paste_back, feather_coverage
 from .color import (
     reinhard_color_transfer, low_freq_shading_correction, inject_skin_detail,
@@ -26,6 +26,19 @@ STOP = object()
 
 _GPEN_BLEND_MAX  = 0.8
 _GPEN_BLEND_STEP = 0.08   # ramp over ~10 frames at enable/disable transitions
+_GPEN_PROBE_FRAMES = 90   # while disabled, re-measure restoration cost this often
+_MAX_HELD_FRAMES = 5      # reuse the last face geometry across this many missed detections
+
+
+def fit_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Center-crop to the target aspect ratio, then resize; never stretches."""
+    h, w = frame.shape[:2]
+    if (h, w) == (height, width):
+        return frame
+    crop_w = min(w, round(h * width / height))
+    crop_h = min(h, round(w * height / width))
+    x0, y0 = (w - crop_w) // 2, (h - crop_h) // 2
+    return cv2.resize(frame[y0:y0 + crop_h, x0:x0 + crop_w], (width, height))
 
 
 def put_latest(mailbox: queue.Queue, item) -> None:
@@ -104,6 +117,15 @@ class SwapPipeline:
         self._occluder: OcclusionDetector | None = OcclusionDetector() if use_occluder else None
         # Optional WebRTC streamer (set via set_webrtc_streamer)
         self._webrtc = None
+        # Serializes process_frame against set_source_face from the GUI thread.
+        self._lock = threading.Lock()
+        # Last detected face, reused briefly when detection drops out.
+        self._held_target = None
+        self._missed = 0
+        if enhancer is not None:
+            # The first CUDA call is far slower than steady state; keep it out
+            # of the restoration budget average.
+            enhancer.enhance(np.zeros((512, 512, 3), np.uint8))
 
     @property
     def average_inference_ms(self) -> float:
@@ -123,13 +145,16 @@ class SwapPipeline:
         self._enhance_enabled = True
         self._gpen_blend = 0.0
         self._spec_mask_prev = None
+        self._held_target = None
+        self._missed = 0
 
     def set_webrtc_streamer(self, streamer) -> None:
         self._webrtc = streamer
 
     def set_source_face(self, face) -> None:
-        self._source_face = face
-        self._reset_tracking()
+        with self._lock:
+            self._source_face = face
+            self._reset_tracking()
 
     def set_profile(self, profile) -> None:
         if isinstance(profile, np.ndarray):
@@ -155,55 +180,77 @@ class SwapPipeline:
         return self._enhance_enabled
 
     def process_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
+        with self._lock:
+            return self._process_frame(frame_bgr)
+
+    def _process_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
         if self._source_face is None:
             return frame_bgr
         started = time.perf_counter()
         timer = self._timer
         timer.start()
-        target = detect_largest(frame_bgr)
+        target = detect_tracked(
+            frame_bgr, None if self._held_target is None else self._held_target.bbox)
         timer.mark('detect')
         if target is None:
-            self._reset_tracking()
-            return frame_bgr
+            # A brief dropout keeps the last geometry instead of flashing the
+            # unprocessed frame and discarding all temporal state.
+            self._missed += 1
+            if self._held_target is None or self._missed > _MAX_HELD_FRAMES:
+                self._reset_tracking()
+                return frame_bgr
+            target = self._held_target
+        else:
+            self._held_target = target
+            self._missed = 0
         dt = 1 / 30 if self._last_frame_time is None else max(1e-3, started - self._last_frame_time)
         self._last_frame_time = started
-        _, width = frame_bgr.shape[:2]
+        height, width = frame_bgr.shape[:2]
 
         # Single smoother filters face params from raw landmarks, then derives
         # both transforms from the same filtered geometry (fix #11: coupling).
-        filtered_kps = self._face_smoother.smooth(target.kps, dt)
-        M_swap = estimate_transform(filtered_kps, 256)
+        filtered_kps = self._face_smoother.smooth(target.kps, dt, (width, height))
+        # Pixel boost swaps the same ArcFace-aligned crop at 512px (the swap
+        # model's alignment, not FFHQ's); scaling the matrix scales the crop.
+        swap_size = 512 if self._pixel_boost else 256
+        M_swap = estimate_transform(filtered_kps, 256) * (swap_size / 256)
         M_ffhq = estimate_transform(filtered_kps, 512)
 
         # Extract only AFTER smoothing; these exact transforms also define paste-back.
-        crop_swap = cv2.warpAffine(frame_bgr, M_swap, (256, 256), borderMode=cv2.BORDER_REFLECT)
+        crop_swap = cv2.warpAffine(frame_bgr, M_swap, (swap_size, swap_size),
+                                   borderMode=cv2.BORDER_REFLECT)
         crop_ffhq = cv2.warpAffine(frame_bgr, M_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
         timer.mark('align')
-        if self._pixel_boost:
-            # Pixel-boost: swap at 512px resolution via 4-patch tiling
-            aligned = self._swapper.swap(crop_ffhq, self._source_face, pixel_boost=True)
-        else:
-            swapped = self._swapper.swap(crop_swap, self._source_face)
-            swap_h = np.vstack((M_swap, [0, 0, 1]))
-            ffhq_h = np.vstack((M_ffhq, [0, 0, 1]))
-            to_ffhq = (ffhq_h @ np.linalg.inv(swap_h))[:2]
-            aligned = cv2.warpAffine(swapped, to_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
+        swapped = self._swapper.swap(crop_swap, self._source_face,
+                                     pixel_boost=self._pixel_boost)
+        swap_h = np.vstack((M_swap, [0, 0, 1]))
+        ffhq_h = np.vstack((M_ffhq, [0, 0, 1]))
+        to_ffhq = (ffhq_h @ np.linalg.inv(swap_h))[:2]
+        aligned = cv2.warpAffine(swapped, to_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
         # Feathered coverage mask prevents hard boundary at the swap crop edge (fix #4).
-        coverage_raw = cv2.warpAffine(np.ones((256, 256), np.float32), to_ffhq, (512, 512))
+        coverage_raw = cv2.warpAffine(np.ones((swap_size, swap_size), np.float32),
+                                      to_ffhq, (512, 512))
         coverage = feather_coverage(coverage_raw)
         timer.mark('swap')
         gpen_ms = 0.0
-        if self._should_enhance((time.perf_counter() - started) * 1000):
-            # Ramp blend weight in over ~10 frames to avoid a pop at enable (fix #2).
-            self._gpen_blend = min(_GPEN_BLEND_MAX, self._gpen_blend + _GPEN_BLEND_STEP)
+        # Ramp the blend weight over ~10 frames in both directions (fix #2).
+        # Restoration keeps running while the weight ramps down, so disabling
+        # it fades out instead of popping.
+        wanted = self._should_enhance((time.perf_counter() - started) * 1000)
+        step = _GPEN_BLEND_STEP if wanted else -_GPEN_BLEND_STEP
+        self._gpen_blend = min(_GPEN_BLEND_MAX, max(0.0, self._gpen_blend + step))
+        if self._enhancer is not None and self._gpen_blend > 1e-6:
             before = time.perf_counter()
             enhanced = self._enhancer.enhance_with_blend(aligned, blend=self._gpen_blend)
             gpen_ms = (time.perf_counter() - before) * 1000
             self._gpen_times.append(gpen_ms)
         else:
-            self._gpen_blend = max(0.0, self._gpen_blend - _GPEN_BLEND_STEP)
             enhanced = aligned
             self.gpen_skipped += 1
+            if self.gpen_skipped % _GPEN_PROBE_FRAMES == 0:
+                # Cost samples only arrive while restoration runs. Drop the
+                # stale ones so the gate can re-enable and measure again.
+                self._gpen_times.clear()
         timer.mark('gpen')
         # Ownership masks come from the target: restoration may erase glasses
         # or change the mouth cavity before segmentation could preserve them.
@@ -253,12 +300,12 @@ class SwapPipeline:
         # BlinkGate: use 2d106det landmarks from buffalo_l; falls back gracefully to
         # is_blinking=False when landmark_2d_106 is None (e.g. on first frame).
         is_blinking = False
-        left_6, right_6 = get_eye_landmarks_6pt(target)
-        if left_6 is not None:
-            ear = (eye_aspect_ratio(left_6) + eye_aspect_ratio(right_6)) * 0.5
+        left_eye, right_eye = get_eye_landmarks(target)
+        if left_eye is not None:
+            ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) * 0.5
             is_blinking = self._blink_gate.update(ear)
         dynamic = self._parser.get_region_mask(seg, [4, 5, 11, 12, 13])
-        dynamic = cv2.warpAffine(dynamic, cv2.invertAffineTransform(M_ffhq), (width, frame_bgr.shape[0]))
+        dynamic = cv2.warpAffine(dynamic, cv2.invertAffineTransform(M_ffhq), (width, height))
         temporal_mask = frame_mask * (1.0 - dynamic.astype(np.float32) / 255.0)
         full = self._ema.blend(full, gray, target.bbox, is_blinking=is_blinking,
                                face_mask=temporal_mask)
@@ -350,9 +397,7 @@ class AsyncPipelineRunner:
                 item = self._take(self._raw_q)
                 if item is STOP:
                     break
-                if item.shape[:2] != (self._target_h, self._target_w):
-                    item = cv2.resize(item, (self._target_w, self._target_h))
-                put_latest(self._pre_q, item)
+                put_latest(self._pre_q, fit_frame(item, self._target_w, self._target_h))
         except Exception:
             logger.exception('Preprocessing failed')
         finally:

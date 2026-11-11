@@ -19,8 +19,9 @@ BiSeNet CANNOT use TRT FP16 — softmax over 19 classes is fragile. Use CUDA FP3
 from __future__ import annotations
 import cv2
 import numpy as np
-import onnxruntime as ort
 from pathlib import Path
+
+from .ort_utils import create_session
 
 SWAP_LABELS    = [1, 2, 3, 4, 5, 10, 11, 12, 13]
 PRESERVE_LABELS = [0, 6, 7, 8, 9, 14, 15, 16, 17, 18]
@@ -37,16 +38,7 @@ _FP32_PROVIDERS = [
 
 class FaceParser:
     def __init__(self, model_path: str | Path, logit_ema_alpha: float = 0.6):
-        providers = [p for p in ("CUDAExecutionProvider", "DmlExecutionProvider",
-                                  "CPUExecutionProvider") if p in ort.get_available_providers()]
-        opts = ort.SessionOptions()
-        if "DmlExecutionProvider" in providers:
-            opts.enable_mem_pattern = False
-            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self._session = ort.InferenceSession(
-            str(model_path), sess_options=opts, providers=providers
-        )
+        self._session = create_session(model_path)
         self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
         self._logit_ema_alpha = logit_ema_alpha
