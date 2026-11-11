@@ -11,13 +11,13 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from .detector import detect_largest
+from .detector import detect_largest, get_eye_landmarks_6pt
 from .aligner import estimate_transform, paste_back, feather_coverage
 from .color import (
     reinhard_color_transfer, low_freq_shading_correction, inject_skin_detail,
-    apply_sss, transfer_specular, composite_mouth_interior,
+    apply_sss, transfer_specular, composite_mouth_interior, match_camera_degradation,
 )
-from .temporal import FaceParamSmoother, TemporalEMA
+from .temporal import FaceParamSmoother, TemporalEMA, BlinkGate, eye_aspect_ratio
 
 logger = logging.getLogger(__name__)
 STOP = object()
@@ -69,6 +69,8 @@ class SwapPipeline:
         self._gpen_blend: float = 0.0
         # Specular mask cache for temporal EMA (fix #9)
         self._spec_mask_prev: np.ndarray | None = None
+        # Blink gate: requires 2d106det landmarks (available via buffalo_l pack)
+        self._blink_gate = BlinkGate()
 
     @property
     def average_inference_ms(self) -> float:
@@ -78,6 +80,7 @@ class SwapPipeline:
         self._face_smoother.reset()
         self._ema.reset()
         self._parser.reset()
+        self._blink_gate.reset()
         self._last_frame_time = None
         self._enhance_enabled = True
         self._gpen_blend = 0.0
@@ -170,14 +173,25 @@ class SwapPipeline:
             result, self._spec_mask_prev = transfer_specular(
                 crop_ffhq, result, skin, prev_spec=self._spec_mask_prev)
         result = composite_mouth_interior(result, crop_ffhq, mouth)
-        full, frame_mask = paste_back(frame_bgr, result, M_ffhq, mask=mask, return_mask=True)
+        # Camera degradation: match noise grain, sharpness, and motion blur of the
+        # target camera feed. Applied before paste_back (last crop-space quality step).
+        # flow_vec comes from TemporalEMA.get_face_flow — reuses its prev_gray store.
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        # Five-point landmarks lack eyelid contours: blink detection is disabled
-        # for MVP (BlinkGate requires 6-pt eye landmarks for EAR computation).
+        flow_vec = self._ema.get_face_flow(gray, target.bbox)
+        result = match_camera_degradation(result, crop_ffhq, skin, flow_vec)
+        full, frame_mask = paste_back(frame_bgr, result, M_ffhq, mask=mask, return_mask=True)
+        # BlinkGate: use 2d106det landmarks from buffalo_l; falls back gracefully to
+        # is_blinking=False when landmark_2d_106 is None (e.g. on first frame).
+        is_blinking = False
+        left_6, right_6 = get_eye_landmarks_6pt(target)
+        if left_6 is not None:
+            ear = (eye_aspect_ratio(left_6) + eye_aspect_ratio(right_6)) * 0.5
+            is_blinking = self._blink_gate.update(ear)
         dynamic = self._parser.get_region_mask(seg, [4, 5, 11, 12, 13])
         dynamic = cv2.warpAffine(dynamic, cv2.invertAffineTransform(M_ffhq), (width, frame_bgr.shape[0]))
         temporal_mask = frame_mask * (1.0 - dynamic.astype(np.float32) / 255.0)
-        full = self._ema.blend(full, gray, target.bbox, face_mask=temporal_mask)
+        full = self._ema.blend(full, gray, target.bbox, is_blinking=is_blinking,
+                               face_mask=temporal_mask)
         self.last_inference_ms = (time.perf_counter() - started) * 1000
         self._inference_times.append(self.last_inference_ms)
         self._base_times.append(max(0.0, self.last_inference_ms - gpen_ms))

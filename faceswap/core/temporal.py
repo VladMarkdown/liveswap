@@ -231,6 +231,10 @@ class BlinkGate:
 
         return self._is_blinking
 
+    def reset(self) -> None:
+        self._ear_history = []
+        self._is_blinking = False
+
 
 # ---------------------------------------------------------------------------
 # Motion-Adaptive EMA
@@ -298,6 +302,23 @@ class TemporalEMA:
         self._prev_frame = result.copy()
         self._prev_gray = gray.copy()
         return result
+
+    def get_face_flow(self, current_gray: np.ndarray, face_bbox) -> np.ndarray:
+        """Return median optical flow vector over the face bounding box.
+        Call BEFORE blend() — prev_gray still points to the previous frame.
+        Returns zero vector if no history or bbox is degenerate."""
+        if self._prev_gray is None or self._prev_gray.shape != current_gray.shape:
+            return np.zeros(2, dtype=np.float32)
+        h, w = current_gray.shape
+        x1, y1 = max(0, int(face_bbox[0])), max(0, int(face_bbox[1]))
+        x2, y2 = min(w, int(face_bbox[2])), min(h, int(face_bbox[3]))
+        if x2 <= x1 or y2 <= y1:
+            return np.zeros(2, dtype=np.float32)
+        flow = cv2.calcOpticalFlowFarneback(
+            current_gray[y1:y2, x1:x2], self._prev_gray[y1:y2, x1:x2], None,
+            pyr_scale=0.5, levels=2, winsize=15,
+            iterations=2, poly_n=5, poly_sigma=1.1, flags=0)
+        return np.median(flow.reshape(-1, 2), axis=0).astype(np.float32)
 
     def reset(self) -> None:
         self._prev_frame = None

@@ -8,7 +8,8 @@ Color correction pipeline. EXACT ORDER (critical):
   6. SSS approximation (Jimenez separable Gaussian, linearized)
   7. Specular highlight transfer (temporal EMA on spec mask)
   8. Composite mouth interior (class 11) from target
-  9. Motion-compensated temporal EMA
+  9. Camera degradation matching (noise grain, sharpness, motion blur — last crop step)
+ 10. Motion-compensated temporal EMA
 
 Reference for color correction: original target crop BEFORE enhancement.
 Apply color correction again after GPEN (GPEN shifts colors — re-run once).
@@ -245,6 +246,82 @@ def transfer_specular(target_face: np.ndarray, swapped_face: np.ndarray,
         0, 255
     ).astype(np.uint8)
     return result, spec
+
+
+def match_camera_degradation(
+    swapped: np.ndarray,
+    target: np.ndarray,
+    skin_mask: np.ndarray | None = None,
+    flow_vec: np.ndarray | None = None,
+    noise_alpha: float = 0.7,
+    sharp_alpha: float = 0.5,
+    blur_alpha: float = 0.6,
+) -> np.ndarray:
+    """
+    Match camera fingerprint of target to swapped face crop (last crop-space step).
+    - Noise: estimate σ via MAD from target high-pass on flat skin; add synthetic grain.
+    - Sharpness: equalize Laplacian variance between crops.
+    - Motion blur: directional line kernel when |flow_vec| > 1.5 px.
+    """
+    h, w = swapped.shape[:2]
+    result = swapped.astype(np.float32)
+    target_f = target.astype(np.float32)
+
+    # Flat-skin mask: used as the region for noise/sharpness statistics.
+    tgt_gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    flat = (np.abs(cv2.Laplacian(tgt_gray, cv2.CV_32F)) < 8.0).astype(np.float32)
+    if skin_mask is not None:
+        flat *= (skin_mask > 127).astype(np.float32)
+    flat_mask = flat > 0
+
+    # --- Noise matching ---
+    hp = target_f - cv2.GaussianBlur(target_f, (0, 0), 1.5)
+    noise_sigma = np.zeros(3, dtype=np.float32)
+    if flat_mask.sum() > 100:
+        for ch in range(3):
+            mad = float(np.median(np.abs(hp[..., ch][flat_mask])))
+            noise_sigma[ch] = float(np.clip(mad / 0.6745, 0, 15))
+    grain_raw = np.random.default_rng().standard_normal((h, w, 3)).astype(np.float32)
+    grain = cv2.GaussianBlur(grain_raw, (0, 0), 0.6) * noise_sigma[np.newaxis, np.newaxis, :]
+    with_noise = cv2.GaussianBlur(result, (0, 0), 0.8) + grain
+    result = result * (1.0 - noise_alpha) + with_noise * noise_alpha
+
+    # --- Sharpness matching ---
+    if flat_mask.sum() > 100:
+        lap_sw = cv2.Laplacian(cv2.cvtColor(swapped, cv2.COLOR_BGR2GRAY).astype(np.float32),
+                               cv2.CV_32F)
+        lap_tg = cv2.Laplacian(tgt_gray, cv2.CV_32F)
+        var_sw = float(lap_sw[flat_mask].var()) + 1e-6
+        var_tg = float(lap_tg[flat_mask].var()) + 1e-6
+        ratio = float(np.sqrt(var_tg / var_sw))
+        if ratio < 0.9:
+            sigma_b = min(2.0, (1.0 - ratio) * 3.0)
+            softer = cv2.GaussianBlur(result, (0, 0), sigma_b)
+            result = result * (1.0 - sharp_alpha) + softer * sharp_alpha
+        elif ratio > 1.1:
+            blurred = cv2.GaussianBlur(result, (0, 0), 1.0)
+            sharpened = result + (result - blurred) * min(ratio - 1.0, 1.0)
+            result = result * (1.0 - sharp_alpha) + sharpened * sharp_alpha
+
+    # --- Motion blur matching ---
+    if flow_vec is not None:
+        flow_norm = float(np.linalg.norm(flow_vec))
+        if flow_norm > 1.5:
+            ksize = max(3, min(int(round(flow_norm)), 25)) | 1  # ensure odd
+            half = ksize // 2
+            kernel = np.zeros((ksize, ksize), dtype=np.float32)
+            ang = float(np.arctan2(float(flow_vec[1]), float(flow_vec[0])))
+            dx, dy = np.cos(ang), np.sin(ang)
+            for i in range(-half, half + 1):
+                xi, yi = int(round(half + dx * i)), int(round(half + dy * i))
+                if 0 <= xi < ksize and 0 <= yi < ksize:
+                    kernel[yi, xi] += 1.0
+            ksum = kernel.sum()
+            if ksum > 0:
+                blurred_m = cv2.filter2D(result, cv2.CV_32F, kernel / ksum)
+                result = result * (1.0 - blur_alpha) + blurred_m * blur_alpha
+
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def composite_mouth_interior(swapped: np.ndarray, target: np.ndarray,
