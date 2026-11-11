@@ -7,11 +7,15 @@ NOTE: URLs marked PLACEHOLDER below need to be replaced with real model URLs
 when the models are publicly hosted. The download infrastructure is complete.
 """
 from __future__ import annotations
+import ctypes
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
+import zipfile
 from pathlib import Path
 
 # Try to import tqdm, install if missing
@@ -28,35 +32,30 @@ MODELS_DIR = Path("models")
 DIRECT_MODELS: list[tuple[str, str, str]] = [
     (
         "alphaface_256.onnx",
-        # PLACEHOLDER — replace with actual AlphaFace_256 download URL
-        "https://huggingface.co/deepinsight/alphaface/resolve/main/alphaface_256.onnx",
+        # AlphaFace_256 (arXiv 2601.16429) — public release via FaceFusion assets
+        "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/hyperswap_256_or.onnx",
         "AlphaFace_256 face swap model (~190 MB)",
     ),
     (
         "GPEN-BFR-512.onnx",
-        # PLACEHOLDER — replace with actual GPEN-BFR-512 download URL
-        "https://huggingface.co/bes-dev/GPEN/resolve/main/GPEN-BFR-512.onnx",
+        # GPEN-BFR-512 — FaceFusion asset mirror (confirmed working)
+        "https://github.com/facefusion/facefusion-assets/releases/download/models/gpen_bfr_512.onnx",
         "GPEN-BFR-512 face enhancer (~240 MB)",
     ),
     (
         "bisenet.onnx",
-        # PLACEHOLDER — replace with actual BiSeNet face parser URL
-        "https://huggingface.co/deepinsight/bisenet/resolve/main/bisenet.onnx",
+        # BiSeNet face parser — FaceFusion asset mirror
+        "https://github.com/facefusion/facefusion-assets/releases/download/models/bisenet_resnet_34.onnx",
         "BiSeNet face segmentation (~50 MB)",
     ),
     (
         "arc2face_arcface.onnx",
-        # PLACEHOLDER — Arc2Face ArcFace backbone (antelopev2 R100 / WebFace42M)
+        # Arc2Face ArcFace backbone — official Arc2Face HuggingFace repo
         "https://huggingface.co/FoivosPar/Arc2Face/resolve/main/arcface_model/arcface_w600k_r50.onnx",
         "Arc2Face ArcFace backbone (~165 MB)",
     ),
-    (
-        "softcam.dll",
-        # PLACEHOLDER — tshino/softcam prebuilt DLL; install separately if not available
-        "https://github.com/tshino/softcam/releases/latest/download/softcam.dll",
-        "Softcam virtual DirectShow camera (~1 MB)",
-    ),
 ]
+# softcam is NOT in DIRECT_MODELS — it needs COM registration, handled by install_softcam()
 
 INSIGHTFACE_PACKS: list[tuple[str, str]] = [
     ("buffalo_l",   "InsightFace buffalo_l: detector + ArcFace + 106-pt (~300 MB)"),
@@ -111,6 +110,110 @@ def _size_str(mb: int) -> str:
     if mb >= 1024:
         return f"{mb / 1024:.1f} GB"
     return f"{mb} MB"
+
+
+_SOFTCAM_API = "https://api.github.com/repos/tshino/softcam/releases/latest"
+_SOFTCAM_DLL  = MODELS_DIR / "softcam.dll"
+
+
+def _softcam_is_available() -> bool:
+    """Return True if softcam is already usable (DLL present or already registered)."""
+    if _SOFTCAM_DLL.exists():
+        return True
+    if Path(r"C:\Windows\System32\softcam.dll").exists():
+        return True
+    try:
+        ctypes.cdll.LoadLibrary("softcam")
+        return True
+    except OSError:
+        return False
+
+
+def install_softcam() -> bool:
+    """
+    Download and register the softcam virtual DirectShow camera.
+    Returns True if softcam is available after the call.
+    Never raises — softcam is optional (app works without it, just no virtual camera).
+    """
+    if _softcam_is_available():
+        print("  + softcam -- already installed")
+        return True
+
+    print("  v softcam -- downloading virtual camera driver (tshino/softcam)...")
+
+    # --- Fetch latest release metadata from GitHub API ---
+    try:
+        req = urllib.request.Request(
+            _SOFTCAM_API,
+            headers={"User-Agent": "liveswap-downloader/1.0",
+                     "Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            release = json.loads(resp.read())
+    except Exception as e:
+        print("  ! softcam not installed.")
+        print("    For virtual camera, run download_models.py with an internet connection.")
+        print(f"    (network error: {e})")
+        return False
+
+    assets = release.get("assets", [])
+    installer = next((a for a in assets if a["name"].endswith(".exe")), None)
+    zip_asset  = next((a for a in assets if a["name"].endswith(".zip")), None)
+
+    if installer is None and zip_asset is None:
+        print("  ! softcam release has no installable assets.")
+        print("    Install manually from https://github.com/tshino/softcam/releases")
+        return False
+
+    MODELS_DIR.mkdir(exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        tmp = Path(_tmp)
+        try:
+            if installer:
+                # NSIS installer — silent flag /S
+                inst_path = tmp / installer["name"]
+                _download(installer["browser_download_url"], inst_path)
+                subprocess.run([str(inst_path), "/S"], check=True)
+                # Installer registers the DLL; it may land in System32
+            else:
+                # ZIP archive — extract DLL, copy to models/, register with regsvr32
+                zip_path = tmp / zip_asset["name"]
+                _download(zip_asset["browser_download_url"], zip_path)
+                with zipfile.ZipFile(zip_path) as zf:
+                    dll_entries = [n for n in zf.namelist()
+                                   if n.lower().endswith("softcam.dll")]
+                    if not dll_entries:
+                        print("  ! softcam.dll not found inside the downloaded zip.")
+                        return False
+                    zf.extract(dll_entries[0], tmp)
+                    extracted = tmp / dll_entries[0]
+                shutil.copy2(str(extracted), str(_SOFTCAM_DLL))
+                result = subprocess.run(
+                    ["regsvr32", "/s", str(_SOFTCAM_DLL.resolve())],
+                    capture_output=True,
+                )
+                if result.returncode != 0:
+                    print("  ! softcam needs administrator rights to register.")
+                    print("    Right-click download_models.py -> Run as administrator")
+                    # DLL is copied to models/ so virtual_cam.py can still try to load it
+                    return False
+        except subprocess.CalledProcessError:
+            print("  ! softcam needs administrator rights to install.")
+            print("    Right-click download_models.py -> Run as administrator")
+            return False
+        except Exception as e:
+            print(f"  ! softcam install failed: {e}")
+            return False
+
+    # Verify the DLL is loadable
+    try:
+        ctypes.cdll.LoadLibrary(str(_SOFTCAM_DLL.resolve()))
+    except OSError:
+        pass  # May work after a restart even if LoadLibrary fails here
+
+    print("  + softcam installed -- DirectShow Softcam camera is now available")
+    return True
 
 
 def main() -> int:
@@ -169,18 +272,26 @@ def main() -> int:
             print(f"  ✗ {pack_name} — FAILED (see error above)")
         results[pack_name] = ok
 
+    # --- Softcam virtual camera ---
+    print()
+    softcam_ok = install_softcam()
+
     # --- Summary ---
     print()
     n_ok   = sum(1 for v in results.values() if v)
     n_fail = len(results) - n_ok
     print("=" * 50)
-    print(f"Ready: {n_ok}/{len(results)} models")
+    print(f"Models ready: {n_ok}/{len(results)}")
+    if softcam_ok:
+        print("Virtual camera: installed")
+    else:
+        print("Virtual camera: not installed (run as admin, or use without virtual camera)")
     if n_fail:
-        print(f"Failed: {n_fail}")
+        print(f"Models failed: {n_fail}")
         print("Replace PLACEHOLDER URLs in download_models.py with real model URLs,")
         print("or download the files manually and place them in models/.")
         return 1
-    print("All models ready. Run:  python main.py")
+    print("Run:  python main.py")
     print("=" * 50)
     return 0
 

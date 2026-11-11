@@ -94,6 +94,20 @@ class _ModelsDialog(QDialog):
             self._download_btn.setText("Retry")
 
 
+def _softcam_present() -> bool:
+    """Quick check: is the softcam DLL available without importing ctypes at module level."""
+    import ctypes
+    if _SOFTCAM_PATH.exists():
+        return True
+    if Path(r"C:\Windows\System32\softcam.dll").exists():
+        return True
+    try:
+        ctypes.cdll.LoadLibrary("softcam")
+        return True
+    except OSError:
+        return False
+
+
 def _check_models(app: QApplication) -> bool:
     """Return True if all required models are present, else show download dialog."""
     if _REQUIRED_MODEL.exists():
@@ -118,6 +132,12 @@ def main():
     from faceswap.gui.main_window import MainWindow
     window = MainWindow()
     window.show()
+
+    # Non-blocking softcam warning (models are present but softcam not registered)
+    if not _softcam_present():
+        window.statusBar().showMessage(
+            "Virtual camera not installed — run download_models.py as admin")
+
     sys.exit(app.exec())
 
 
