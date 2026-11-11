@@ -3,8 +3,12 @@ Download all required liveswap models to models/.
 Run once before launching the application:
     python download_models.py
 
-NOTE: URLs marked PLACEHOLDER below need to be replaced with real model URLs
-when the models are publicly hosted. The download infrastructure is complete.
+Live mode needs the swap, restoration and parsing models plus the buffalo_l
+pack. The Arc2Face files are only used by profile mode; a failure there is
+reported but does not fail the run.
+
+Console output is ASCII only: a redirected stdout on Windows uses the legacy
+code page and cannot encode symbols such as check marks.
 """
 from __future__ import annotations
 import ctypes
@@ -27,43 +31,43 @@ except ImportError:
 
 MODELS_DIR = Path("models")
 
-# (filename, url, description)
-# PLACEHOLDER URLs: replace with real hosted URLs before distributing
-DIRECT_MODELS: list[tuple[str, str, str]] = [
+# (filename, url, description, required for live mode)
+DIRECT_MODELS: list[tuple[str, str, str, bool]] = [
     (
-        "alphaface_256.onnx",
-        # AlphaFace_256 (arXiv 2601.16429) — public release via FaceFusion assets
-        "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/hyperswap_256_or.onnx",
-        "AlphaFace_256 face swap model (~190 MB)",
+        "hyperswap_1b_256.onnx",
+        "https://github.com/facefusion/facefusion-assets/releases/download/models-3.3.0/hyperswap_1b_256.onnx",
+        "HyperSwap 1b 256 face swap model",
+        True,
     ),
     (
         "GPEN-BFR-512.onnx",
-        # GPEN-BFR-512 — FaceFusion asset mirror (confirmed working)
-        "https://github.com/facefusion/facefusion-assets/releases/download/models/gpen_bfr_512.onnx",
+        "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/gpen_bfr_512.onnx",
         "GPEN-BFR-512 face enhancer (~240 MB)",
+        True,
     ),
     (
         "bisenet.onnx",
-        # BiSeNet face parser — FaceFusion asset mirror
-        "https://github.com/facefusion/facefusion-assets/releases/download/models/bisenet_resnet_34.onnx",
+        "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/bisenet_resnet_34.onnx",
         "BiSeNet face segmentation (~50 MB)",
+        True,
     ),
     (
         "arc2face_arcface.onnx",
-        # Arc2Face ArcFace backbone — official Arc2Face HuggingFace repo
-        "https://huggingface.co/FoivosPar/Arc2Face/resolve/main/arcface_model/arcface_w600k_r50.onnx",
-        "Arc2Face ArcFace backbone (~165 MB)",
+        "https://huggingface.co/FoivosPar/Arc2Face/resolve/main/arcface.onnx",
+        "Arc2Face ArcFace backbone, profile mode only",
+        False,
     ),
 ]
-# softcam is NOT in DIRECT_MODELS — it needs COM registration, handled by install_softcam()
+# softcam is NOT in DIRECT_MODELS - it needs COM registration, handled by install_softcam()
 
-INSIGHTFACE_PACKS: list[tuple[str, str]] = [
-    ("buffalo_l",   "InsightFace buffalo_l: detector + ArcFace + 106-pt (~300 MB)"),
-    ("antelopev2",  "InsightFace antelopev2: ArcFace R100 for Arc2Face (~300 MB)"),
+# (pack name, description, required for live mode)
+INSIGHTFACE_PACKS: list[tuple[str, str, bool]] = [
+    ("buffalo_l",   "InsightFace buffalo_l: detector + ArcFace + 106-pt (~300 MB)", True),
+    ("antelopev2",  "InsightFace antelopev2: ArcFace R100, profile mode only (~300 MB)", False),
 ]
 
 APPROX_SIZES_MB: dict[str, int] = {
-    "alphaface_256.onnx":  190,
+    "hyperswap_1b_256.onnx": 400,
     "GPEN-BFR-512.onnx":   240,
     "bisenet.onnx":          50,
     "arc2face_arcface.onnx": 165,
@@ -133,7 +137,7 @@ def install_softcam() -> bool:
     """
     Download and register the softcam virtual DirectShow camera.
     Returns True if softcam is available after the call.
-    Never raises — softcam is optional (app works without it, just no virtual camera).
+    Never raises - softcam is optional (app works without it, just no virtual camera).
     """
     if _softcam_is_available():
         print("  + softcam -- already installed")
@@ -171,13 +175,13 @@ def install_softcam() -> bool:
         tmp = Path(_tmp)
         try:
             if installer:
-                # NSIS installer — silent flag /S
+                # NSIS installer - silent flag /S
                 inst_path = tmp / installer["name"]
                 _download(installer["browser_download_url"], inst_path)
                 subprocess.run([str(inst_path), "/S"], check=True)
                 # Installer registers the DLL; it may land in System32
             else:
-                # ZIP archive — extract DLL, copy to models/, register with regsvr32
+                # ZIP archive - extract DLL, copy to models/, register with regsvr32
                 zip_path = tmp / zip_asset["name"]
                 _download(zip_asset["browser_download_url"], zip_path)
                 with zipfile.ZipFile(zip_path) as zf:
@@ -235,41 +239,45 @@ def main() -> int:
     print()
 
     results: dict[str, bool] = {}
+    required: set[str] = set()
 
     # --- Direct ONNX model downloads ---
-    for fname, url, desc in DIRECT_MODELS:
+    for fname, url, desc, needed in DIRECT_MODELS:
+        if needed:
+            required.add(fname)
         dest = MODELS_DIR / fname
         if dest.exists():
-            print(f"  ✓ {fname}  (already present)")
+            print(f"  + {fname}  (already present)")
             results[fname] = True
             continue
-        print(f"  ↓ {fname}  {desc}")
+        print(f"  v {fname}  {desc}")
         try:
             _download(url, dest)
-            print(f"  ✓ {fname} — ready")
+            print(f"  + {fname} - ready")
             results[fname] = True
         except Exception as e:
-            print(f"  ✗ {fname} — FAILED: {e}")
-            if "PLACEHOLDER" in url or "huggingface.co" in url:
-                print(f"    This URL is a placeholder. Download manually:")
-                print(f"    Place the file at: {dest.resolve()}")
+            print(f"  ! {fname} - FAILED: {e}")
+            print(f"    Download it manually and place it at: {dest.resolve()}")
             results[fname] = False
 
     print()
 
     # --- InsightFace model packs ---
-    for pack_name, desc in INSIGHTFACE_PACKS:
-        pack_dir = MODELS_DIR / pack_name
+    for pack_name, desc, needed in INSIGHTFACE_PACKS:
+        if needed:
+            required.add(pack_name)
+        # InsightFace keeps its packs under ~/.insightface/models.
+        pack_dir = Path.home() / ".insightface" / "models" / pack_name
         if pack_dir.exists() and any(pack_dir.iterdir()):
-            print(f"  ✓ {pack_name}  (already present)")
+            print(f"  + {pack_name}  (already present)")
             results[pack_name] = True
             continue
-        print(f"  ↓ {pack_name}  {desc}")
+        print(f"  v {pack_name}  {desc}")
         ok = _download_insightface_pack(pack_name)
         if ok:
-            print(f"  ✓ {pack_name} — ready")
+            print(f"  + {pack_name} - ready")
         else:
-            print(f"  ✗ {pack_name} — FAILED (see error above)")
+            print(f"  ! {pack_name} - FAILED (see error above)")
         results[pack_name] = ok
 
     # --- Softcam virtual camera ---
@@ -278,18 +286,19 @@ def main() -> int:
 
     # --- Summary ---
     print()
-    n_ok   = sum(1 for v in results.values() if v)
-    n_fail = len(results) - n_ok
+    failed = [name for name, ok in results.items() if not ok]
+    blocking = [name for name in failed if name in required]
     print("=" * 50)
-    print(f"Models ready: {n_ok}/{len(results)}")
+    print(f"Models ready: {len(results) - len(failed)}/{len(results)}")
     if softcam_ok:
         print("Virtual camera: installed")
     else:
-        print("Virtual camera: not installed (run as admin, or use without virtual camera)")
-    if n_fail:
-        print(f"Models failed: {n_fail}")
-        print("Replace PLACEHOLDER URLs in download_models.py with real model URLs,")
-        print("or download the files manually and place them in models/.")
+        print("Virtual camera: not installed (the app still runs and shows its preview)")
+    for name in failed:
+        kind = "REQUIRED" if name in required else "optional, profile mode only"
+        print(f"Failed: {name} ({kind})")
+    if blocking:
+        print("Download the required files manually and place them in models/.")
         return 1
     print("Run:  python main.py")
     print("=" * 50)

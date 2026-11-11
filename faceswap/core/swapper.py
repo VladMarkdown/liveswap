@@ -140,3 +140,16 @@ class FaceSwapper:
                 sub = np.ascontiguousarray(crop_512[dy::2, dx::2])
                 result[dy::2, dx::2] = self._swap_single(sub, source_face)
         return result
+
+
+def load_default_swapper(models_dir: str | Path = "models") -> FaceSwapper:
+    """Load the swap model found in models_dir.
+
+    AlphaFace_256 is used when its file has been placed there by hand (it has
+    no public download); otherwise the downloadable HyperSwap 1b model is.
+    """
+    models_dir = Path(models_dir)
+    alphaface = models_dir / "alphaface_256.onnx"
+    if alphaface.exists():
+        return FaceSwapper(alphaface, model_type="alphaface")
+    return FaceSwapper(models_dir / "hyperswap_1b_256.onnx", model_type="hyperswap_1b")

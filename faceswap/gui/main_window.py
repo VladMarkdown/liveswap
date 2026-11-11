@@ -191,6 +191,14 @@ def _label(text: str, name: str = "", wrap: bool = False) -> QLabel:
     return label
 
 
+def _read_image(path: str) -> np.ndarray | None:
+    """cv2.imread that also works for non-ASCII paths on Windows."""
+    try:
+        return cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except OSError:
+        return None
+
+
 def _pixmap_from_bgr(bgr: np.ndarray) -> QPixmap:
     rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
     h, w = rgb.shape[:2]
@@ -376,7 +384,7 @@ class _PhotoStrip(QWidget):
             cell.setPixmap(QPixmap())
             cell.setText("")
             if i < len(self._paths):
-                img = cv2.imread(self._paths[i])
+                img = _read_image(self._paths[i])
                 if img is not None:
                     cell.setPixmap(_pixmap_from_bgr(cv2.resize(img, (46, 46))))
                 else:
@@ -451,7 +459,7 @@ class _LivePage(QWidget):
         self._photo_path = paths[0]
         # Permission is given per person: a new photo needs it again.
         self.consent_cb.setChecked(False)
-        img = cv2.imread(self._photo_path)
+        img = _read_image(self._photo_path)
         if img is not None:
             h, w = img.shape[:2]
             scale = 94 / max(h, w, 1)
@@ -932,11 +940,11 @@ class MainWindow(QMainWindow):
         self._start_pipeline()
 
     def _load_models(self) -> None:
-        from faceswap.core.swapper  import FaceSwapper
+        from faceswap.core.swapper  import load_default_swapper
         from faceswap.core.enhancer import FaceEnhancer
         from faceswap.core.parser   import FaceParser
 
-        self._swapper  = FaceSwapper("models/alphaface_256.onnx",  model_type="alphaface")
+        self._swapper  = load_default_swapper("models")
         self._enhancer = FaceEnhancer("models/GPEN-BFR-512.onnx",
                                       tensorrt=self._settings.get("tensorrt", False))
         self._parser   = FaceParser("models/bisenet.onnx")

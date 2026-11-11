@@ -7,6 +7,28 @@ import onnxruntime as ort
 
 logger = logging.getLogger(__name__)
 
+_preloaded = False
+
+
+def preload_gpu_libraries() -> None:
+    """Load the CUDA and cuDNN DLLs installed by pip, once.
+
+    `pip install onnxruntime-gpu[cuda,cudnn]` puts them in site-packages, where
+    Windows does not look; without this the CUDA provider silently falls back
+    to CPU. Call before the first session is created.
+    """
+    global _preloaded
+    if _preloaded:
+        return
+    _preloaded = True
+    preload = getattr(ort, "preload_dlls", None)
+    if preload is None:
+        return
+    try:
+        preload()
+    except Exception:
+        logger.exception("Could not preload the CUDA/cuDNN libraries")
+
 
 def create_session(model_path: str | Path, tensorrt_fp16: bool = False) -> ort.InferenceSession:
     """Create a session on the best available provider and report which one runs.
@@ -19,6 +41,7 @@ def create_session(model_path: str | Path, tensorrt_fp16: bool = False) -> ort.I
     ONNX Runtime silently falls back to CPU when the CUDA/cuDNN libraries cannot be
     loaded, so the active provider is logged and a CPU fallback is a warning.
     """
+    preload_gpu_libraries()
     available = ort.get_available_providers()
     providers = []
     if tensorrt_fp16 and "TensorrtExecutionProvider" in available:

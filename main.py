@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal
 
 MODELS_DIR = Path("models")
-_REQUIRED_MODEL = MODELS_DIR / "alphaface_256.onnx"
+# Present whenever download_models.py has fetched the live-mode models.
+_REQUIRED_MODEL = MODELS_DIR / "GPEN-BFR-512.onnx"
 _SOFTCAM_PATH = MODELS_DIR / "softcam.dll"
 
 

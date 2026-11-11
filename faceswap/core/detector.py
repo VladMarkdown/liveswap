@@ -17,6 +17,8 @@ def _get_app():
         if _app is None:
             from insightface.app import FaceAnalysis
             import onnxruntime as ort
+            from .ort_utils import preload_gpu_libraries
+            preload_gpu_libraries()
             available = ort.get_available_providers()
             providers = [p for p in ("CUDAExecutionProvider", "DmlExecutionProvider",
                                      "CPUExecutionProvider") if p in available]

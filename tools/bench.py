@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -41,9 +42,13 @@ def main() -> int:
     from faceswap.core.enhancer import FaceEnhancer
     from faceswap.core.parser import FaceParser
     from faceswap.core.pipeline import SwapPipeline, fit_frame
-    from faceswap.core.swapper import FaceSwapper
+    from faceswap.core.swapper import load_default_swapper
 
-    photo = cv2.imread(args.photo)
+    # np.fromfile + imdecode reads non-ASCII paths, which cv2.imread cannot on Windows.
+    try:
+        photo = cv2.imdecode(np.fromfile(args.photo, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except OSError:
+        photo = None
     if photo is None:
         parser.error(f"cannot read {args.photo}")
     source_face = detect_largest(photo)
@@ -52,7 +57,7 @@ def main() -> int:
 
     models = Path(args.models)
     pipeline = SwapPipeline(
-        FaceSwapper(models / "alphaface_256.onnx", model_type="alphaface"),
+        load_default_swapper(models),
         FaceEnhancer(models / "GPEN-BFR-512.onnx", tensorrt=args.tensorrt),
         FaceParser(models / "bisenet.onnx"),
         quality=args.quality, pixel_boost=args.pixel_boost)
@@ -88,7 +93,7 @@ def main() -> int:
     cap.release()
 
     if args.save and output is not None:
-        cv2.imwrite(args.save, output)
+        cv2.imencode(Path(args.save).suffix or ".png", output)[1].tofile(args.save)
     print(json.dumps({"done": True, "frames": frames,
                       "mean_fps": round(frames / max(time.perf_counter() - started, 1e-6), 1)}),
           flush=True)

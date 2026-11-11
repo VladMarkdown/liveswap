@@ -1,0 +1,15 @@
+# Profile mode (Arc2Face + LoRA training), on top of requirements.txt.
+#
+# NOT installed by install.ps1. Two things have to be done by hand first:
+#  - torch must come from the PyTorch CUDA index, not PyPI (PyPI's Windows
+#    wheel is CPU-only):  https://pytorch.org/get-started/locally/
+#  - `arc2face` is not published on PyPI. The code imports it as a package;
+#    upstream (github.com/foivospar/Arc2Face) ships it as a repository
+#    checkout, so it must be put on the Python path manually.
+torch>=2.2.0
+torchvision>=0.17.0
+diffusers>=0.27.0
+transformers>=4.38.0
+accelerate>=0.27.0
+peft>=0.9.0
+safetensors>=0.4.2

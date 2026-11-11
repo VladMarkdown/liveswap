@@ -1,42 +1,34 @@
-# Core inference: install exactly one runtime package.
-# NVIDIA (the supported real-time target) is the default; it needs the CUDA and
-# cuDNN versions listed for your onnxruntime-gpu release. The app logs which
-# provider each model actually runs on and warns on a CPU fallback.
-onnxruntime-gpu>=1.17.0
-# onnxruntime-directml>=1.17.0  # Windows AMD/Intel: use instead of the line above
-# onnxruntime>=1.17.0           # CPU only: far below real-time
+# Live mode. install.ps1 installs this file, then `insightface` with --no-deps
+# (see below). Profile mode needs requirements-profile.txt as well.
 
-# Face analysis
-insightface>=0.7.3
-opencv-python>=4.9.0
+# Inference on NVIDIA GPUs. The extras install the CUDA and cuDNN runtime DLLs
+# from pip, so no separate CUDA toolkit is needed - only a current NVIDIA driver.
+# The app logs which provider each model runs on and warns on a CPU fallback.
+onnxruntime-gpu[cuda,cudnn]>=1.27
+# AMD/Intel on Windows: replace the line above with  onnxruntime-directml
+# CPU only (far below real-time):                    onnxruntime
+
+# insightface declares a dependency on the CPU `onnxruntime` package, which
+# overwrites the GPU build above when both are installed. Install it without
+# its dependencies:   pip install --no-deps "insightface>=2.1"
+# Its real dependencies are listed here instead.
 numpy>=1.26.0
-
-# Image processing
-Pillow>=10.2.0
+opencv-python>=4.9.0,<5   # developed and tested against 4.x
+onnx>=1.13
+scipy>=1.12.0
 scikit-image>=0.22.0
+tqdm>=4.66.0
+requests>=2.31.0
 
-# Profile mode (Arc2Face + LoRA training)
-torch>=2.2.0
-torchvision>=0.17.0
-diffusers>=0.27.0
-transformers>=4.38.0
-accelerate>=0.27.0
-peft>=0.9.0
-safetensors>=0.4.2
-arc2face>=0.1.0
-xformers>=0.0.24  # CUDA acceleration; omit on CPU/DirectML installations
-
-# GUI
+# GUI and image loading
 PySide6>=6.6.0
+Pillow>=10.2.0
 
-# Virtual camera (softcam ctypes wrapper — bundled)
-# softcam DLL bundled in camera/
+# WebRTC phone output (optional feature, off by default)
+aiortc>=1.6.0
+aiohttp>=3.9.0
+qrcode[pil]>=7.4.2
 
 # Utils
-tqdm>=4.66.0
 psutil>=5.9.0
 pyyaml>=6.0.1
-aiortc>=1.6.0           # WebRTC phone output
-aiohttp>=3.9.0          # HTTP server for WebRTC
-qrcode[pil]>=7.4.2      # QR code for phone URL
-requests>=2.31.0        # softcam GitHub API download
