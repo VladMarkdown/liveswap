@@ -99,14 +99,17 @@ def _download(url: str, dest: Path) -> None:
 
 
 def _download_insightface_pack(name: str) -> bool:
-    """Let InsightFace download and cache the pack automatically."""
+    """Download and unpack the pack into InsightFace's own cache.
+
+    Only fetches the files. Building a FaceAnalysis here would need the
+    detection model among the allowed modules, or it fails an assertion.
+    """
     try:
-        from insightface.app import FaceAnalysis
-        app = FaceAnalysis(name=name, allowed_modules=["recognition"])
-        app.prepare(ctx_id=-1)
+        from insightface.utils import ensure_available
+        ensure_available("models", name, root="~/.insightface")
         return True
     except Exception as e:
-        print(f"    Error: {e}")
+        print(f"    Error: {e!r}")
         return False
 
 
