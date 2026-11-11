@@ -1108,7 +1108,15 @@ class MainWindow(QMainWindow):
                 # not 1000 / (time spent on one frame).
                 fps = self._runner.output_fps if self._runner is not None else 0
                 recording = "REC  ·  " if getattr(self, "_recorder", None) is not None else ""
-                self._preview_overlay.set_stats(f"{recording}{fps:.0f} fps  ·  {ms:.0f} ms")
+                camera_fps = getattr(self._cap, "fps", 0.0) or 0.0
+                self._preview_overlay.set_stats(
+                    f"{recording}{fps:.0f} fps  ·  camera {camera_fps:.0f} fps  ·  {ms:.0f} ms")
+                # Every ~10 s, so the log shows whether the camera or the pipeline sets the rate.
+                self._stats_ticks = getattr(self, "_stats_ticks", 0) + 1
+                if self._stats_ticks % 300 == 0:
+                    logging.getLogger(__name__).info(
+                        "Output %.1f fps, camera %.1f fps, work per frame %.0f ms",
+                        fps, camera_fps, ms)
                 slowest = sorted(self._pipeline.stage_ms.items(),
                                  key=lambda item: item[1], reverse=True)[:6]
                 self._preview_overlay.set_stages(
