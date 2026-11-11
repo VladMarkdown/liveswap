@@ -16,7 +16,9 @@ from .aligner import estimate_transform, paste_back, feather_coverage
 from .color import (
     reinhard_color_transfer, low_freq_shading_correction, inject_skin_detail,
     apply_sss, transfer_specular, composite_mouth_interior, match_camera_degradation,
+    pct_harmonize,
 )
+from .occluder import OcclusionDetector
 from .temporal import FaceParamSmoother, TemporalEMA, BlinkGate, eye_aspect_ratio
 
 logger = logging.getLogger(__name__)
@@ -47,7 +49,9 @@ def generate_profile_source_face(profile):
 
 class SwapPipeline:
     def __init__(self, swapper, enhancer, parser, source_face=None,
-                 quality: str = 'ultra', frame_budget_ms: float = 33.0):
+                 quality: str = 'ultra', frame_budget_ms: float = 33.0,
+                 pixel_boost: bool = False, use_pct: bool = False,
+                 use_occluder: bool = False):
         if frame_budget_ms <= 0:
             raise ValueError('frame_budget_ms must be positive')
         self._swapper = swapper
@@ -56,6 +60,8 @@ class SwapPipeline:
         self._source_face = source_face
         self._quality = quality
         self.frame_budget_ms = frame_budget_ms
+        self._pixel_boost = pixel_boost
+        self._use_pct = use_pct
         self._face_smoother = FaceParamSmoother()
         self._ema = TemporalEMA(base_weight=0.55)
         self._inference_times = deque(maxlen=30)
@@ -71,6 +77,10 @@ class SwapPipeline:
         self._spec_mask_prev: np.ndarray | None = None
         # Blink gate: requires 2d106det landmarks (available via buffalo_l pack)
         self._blink_gate = BlinkGate()
+        # Optional occlusion detector
+        self._occluder: OcclusionDetector | None = OcclusionDetector() if use_occluder else None
+        # Optional WebRTC streamer (set via set_webrtc_streamer)
+        self._webrtc = None
 
     @property
     def average_inference_ms(self) -> float:
@@ -85,6 +95,9 @@ class SwapPipeline:
         self._enhance_enabled = True
         self._gpen_blend = 0.0
         self._spec_mask_prev = None
+
+    def set_webrtc_streamer(self, streamer) -> None:
+        self._webrtc = streamer
 
     def set_source_face(self, face) -> None:
         self._source_face = face
@@ -134,11 +147,15 @@ class SwapPipeline:
         # Extract only AFTER smoothing; these exact transforms also define paste-back.
         crop_swap = cv2.warpAffine(frame_bgr, M_swap, (256, 256), borderMode=cv2.BORDER_REFLECT)
         crop_ffhq = cv2.warpAffine(frame_bgr, M_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
-        swapped = self._swapper.swap(crop_swap, self._source_face)
-        swap_h = np.vstack((M_swap, [0, 0, 1]))
-        ffhq_h = np.vstack((M_ffhq, [0, 0, 1]))
-        to_ffhq = (ffhq_h @ np.linalg.inv(swap_h))[:2]
-        aligned = cv2.warpAffine(swapped, to_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
+        if self._pixel_boost:
+            # Pixel-boost: swap at 512px resolution via 4-patch tiling
+            aligned = self._swapper.swap(crop_ffhq, self._source_face, pixel_boost=True)
+        else:
+            swapped = self._swapper.swap(crop_swap, self._source_face)
+            swap_h = np.vstack((M_swap, [0, 0, 1]))
+            ffhq_h = np.vstack((M_ffhq, [0, 0, 1]))
+            to_ffhq = (ffhq_h @ np.linalg.inv(swap_h))[:2]
+            aligned = cv2.warpAffine(swapped, to_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
         # Feathered coverage mask prevents hard boundary at the swap crop edge (fix #4).
         coverage_raw = cv2.warpAffine(np.ones((256, 256), np.float32), to_ffhq, (512, 512))
         coverage = feather_coverage(coverage_raw)
@@ -157,11 +174,20 @@ class SwapPipeline:
         # Ownership masks come from the target: restoration may erase glasses
         # or change the mouth cavity before segmentation could preserve them.
         seg = self._parser.parse(crop_ffhq)
-        mask = self._parser.build_swap_mask(seg, erosion_px=3, transition_px=10) * coverage
+        swap_mask = self._parser.build_swap_mask(seg, erosion_px=3, transition_px=10) * coverage
         skin = self._parser.get_skin_mask(seg)
         mouth = self._parser.get_mouth_interior_mask(seg)
+        # Occlusion: subtract occluded regions from swap mask so original face shows through
+        if self._occluder is not None:
+            occ = self._occluder.get_occlusion_mask(crop_ffhq, bisenet_seg=seg)
+            swap_mask = swap_mask * (1.0 - occ)
+        mask = swap_mask
         # Reinhard correction now applies only within the skin mask (fix C).
         result = reinhard_color_transfer(enhanced, crop_ffhq, mask=skin)
+        # PCT-Net spatial color harmonization: handles directional lighting (Priority 4c).
+        # Reinhard strength reduced to 0.5 implicitly since PCT refines it.
+        if self._use_pct:
+            result = pct_harmonize(result, crop_ffhq, mask=skin)
         # Multiplicative shading correction in linear space, skin mask only (fix #7).
         result = low_freq_shading_correction(result, crop_ffhq, sigma=20.0, skin_mask=skin)
         if self._quality == 'ultra':
@@ -195,6 +221,9 @@ class SwapPipeline:
         self.last_inference_ms = (time.perf_counter() - started) * 1000
         self._inference_times.append(self.last_inference_ms)
         self._base_times.append(max(0.0, self.last_inference_ms - gpen_ms))
+        # WebRTC phone output — non-blocking push (Priority 5)
+        if self._webrtc is not None and self._webrtc.is_active():
+            self._webrtc.send_frame(full)
         return full
 
 

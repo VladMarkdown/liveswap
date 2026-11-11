@@ -10,6 +10,7 @@ AlphaFace / HyperSwap CANNOT use TRT FP16 — documented precision loss (ORT iss
 Use CUDAExecutionProvider FP32 for swap model.
 """
 from __future__ import annotations
+import cv2
 import numpy as np
 import onnxruntime as ort
 from pathlib import Path
@@ -95,41 +96,88 @@ class FaceSwapper:
         emb = emb.reshape(1, 512)
         return emb
 
-    def swap(self, target_crop: np.ndarray, source_face) -> np.ndarray:
+    def swap(self, target_crop: np.ndarray, source_face,
+             pixel_boost: bool = False) -> np.ndarray:
         """
         Swap source identity onto target_crop.
 
         Args:
-            target_crop: aligned face crop, HWC BGR uint8, 256×256
-            source_face: InsightFace face object from source image
-
+            target_crop:  aligned face crop, HWC BGR uint8.
+                          256×256 normally; 512×512 when pixel_boost=True.
+            source_face:  InsightFace face object from source image
+            pixel_boost:  when True and model input is 256px, tiles the 512
+                          crop into 4 overlapping 256 patches, runs the swap
+                          on each, and blends results back to 512×512 for
+                          higher-detail output.
         Returns:
-            swapped crop: HWC BGR uint8, 256×256
+            swapped crop: HWC BGR uint8 (same spatial size as target_crop
+                          when pixel_boost=False; always 512×512 when True)
         """
         if target_crop.dtype != np.uint8 or target_crop.ndim != 3 or target_crop.shape[2] != 3:
             raise ValueError("Swap crop must be HWC BGR uint8")
+
+        model_h = self._image_shape[2] if isinstance(self._image_shape[2], int) and self._image_shape[2] > 0 else 0
+        model_w = self._image_shape[3] if isinstance(self._image_shape[3], int) and self._image_shape[3] > 0 else 0
+
+        if pixel_boost and model_h == 256 and model_w == 256:
+            return self._swap_pixel_boost(target_crop, source_face)
+
         for actual, required in zip(target_crop.shape[:2], self._image_shape[2:]):
             if isinstance(required, int) and required > 0 and actual != required:
                 raise ValueError(f"Swap crop dimensions must match {self._image_shape[2:]}")
-        identity = self._prepare_identity(source_face)
+        return self._swap_single(target_crop, source_face)
 
-        # Preprocess: BGR → RGB, uint8 → float32, HWC → NCHW, /255
+    def _swap_single(self, target_crop: np.ndarray, source_face) -> np.ndarray:
+        """Core single-patch swap — returns same size as input."""
+        identity = self._prepare_identity(source_face)
         rgb = target_crop[:, :, ::-1].astype(np.float32) / 255.0
         if self._model_type.startswith("hyperswap"):
             rgb = rgb * 2.0 - 1.0
-        blob = rgb.transpose(2, 0, 1)[np.newaxis]  # (1, 3, H, W)
-
-        feed = {
-            self._image_input: blob,
-            self._identity_input: identity,
-        }
-        result = self._session.run(self._output_names, feed)[0]  # (1, 3, H, W)
-
-        # Postprocess: NCHW → HWC, clamp, RGB → BGR
+        blob = rgb.transpose(2, 0, 1)[np.newaxis]
+        feed = {self._image_input: blob, self._identity_input: identity}
+        result = self._session.run(self._output_names, feed)[0]
         out = result[0].transpose(1, 2, 0)
         if self._model_type.startswith("hyperswap"):
             out = (out + 1.0) * 127.5
         else:
             out = out * 255.0
         out = np.clip(out, 0, 255).astype(np.uint8)
-        return out[:, :, ::-1]  # RGB → BGR
+        return out[:, :, ::-1]
+
+    def _swap_pixel_boost(self, crop_512: np.ndarray, source_face) -> np.ndarray:
+        """
+        Pixel-boost: tile 512×512 input into 4 overlapping 256×256 patches,
+        swap each independently, blend back with averaged overlap zones.
+        Returns 512×512 BGR uint8.
+        """
+        overlap = 32  # px overlap per side
+        result = np.zeros((512, 512, 3), dtype=np.float32)
+        weight = np.zeros((512, 512, 1), dtype=np.float32)
+
+        # Patch top-left corners: 0,0 / 256,0 / 0,256 / 256,256 (all with overlap)
+        for oy, ox in [(0, 0), (0, 256), (256, 0), (256, 256)]:
+            # Extract 256+overlap patch, clamp to image boundary
+            y0 = max(0, oy - overlap)
+            x0 = max(0, ox - overlap)
+            y1 = min(512, oy + 256 + overlap)
+            x1 = min(512, ox + 256 + overlap)
+            patch = crop_512[y0:y1, x0:x1]
+            # Resize to exactly 256×256 for the model
+            patch_256 = cv2.resize(patch, (256, 256))
+            swapped_256 = self._swap_single(patch_256, source_face)
+            # Resize back to original patch size
+            swapped_patch = cv2.resize(swapped_256, (x1 - x0, y1 - y0))
+            # Build feathered weight: 1 in center, falls to 0 at edges
+            ph, pw = swapped_patch.shape[:2]
+            wx = np.minimum(np.arange(pw, dtype=np.float32) + 1,
+                            np.arange(pw, 0, -1, dtype=np.float32))
+            wy = np.minimum(np.arange(ph, dtype=np.float32) + 1,
+                            np.arange(ph, 0, -1, dtype=np.float32))
+            w2d = np.minimum(wx[np.newaxis, :], wy[:, np.newaxis])
+            w2d = w2d / (w2d.max() + 1e-6)
+            w3d = w2d[..., np.newaxis]
+            result[y0:y1, x0:x1] += swapped_patch.astype(np.float32) * w3d
+            weight[y0:y1, x0:x1] += w3d
+
+        result /= np.maximum(weight, 1e-6)
+        return np.clip(result, 0, 255).astype(np.uint8)

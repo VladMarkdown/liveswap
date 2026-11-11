@@ -334,3 +334,105 @@ def composite_mouth_interior(swapped: np.ndarray, target: np.ndarray,
     alpha = alpha[..., np.newaxis]
     result = swapped.astype(np.float32) * (1 - alpha) + target.astype(np.float32) * alpha
     return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def pct_harmonize(swapped: np.ndarray, target: np.ndarray,
+                  mask: np.ndarray | None = None,
+                  grid: int = 8) -> np.ndarray:
+    """
+    PCT-Net inspired spatially-varying color harmonization (Priority 4c).
+
+    Fits a per-cell affine transform in CIE-Lab space at coarse resolution
+    (grid × grid cells over a 64px thumbnail), then upsamples the per-pixel
+    transform map to the full image size with bilinear interpolation.
+
+    Handles directional lighting differences that global Reinhard misses
+    (e.g. left/right illumination asymmetry).
+
+    Args:
+        swapped: (512, 512, 3) BGR uint8 — the swapped face crop.
+        target:  (512, 512, 3) BGR uint8 — reference camera frame crop.
+        mask:    (512, 512) uint8 optional skin mask; only masked pixels
+                 contribute to the affine fits (reduces non-skin contamination).
+        grid:    number of cells per dimension (default 8 → 8×8=64 cells).
+    Returns:
+        (H, W, 3) BGR uint8 with spatially-corrected colours.
+    """
+    h, w = swapped.shape[:2]
+    thumb = 64  # coarse resolution for fitting
+
+    sw_t  = cv2.resize(swapped, (thumb, thumb)).astype(np.float32)
+    tgt_t = cv2.resize(target,  (thumb, thumb)).astype(np.float32)
+
+    # Convert to Lab (float32, [0,255] → Lab)
+    sw_lab  = cv2.cvtColor(sw_t.astype(np.uint8),  cv2.COLOR_BGR2Lab).astype(np.float32)
+    tgt_lab = cv2.cvtColor(tgt_t.astype(np.uint8), cv2.COLOR_BGR2Lab).astype(np.float32)
+
+    if mask is not None:
+        mask_t = cv2.resize(mask, (thumb, thumb)).astype(np.float32) / 255.0
+    else:
+        mask_t = np.ones((thumb, thumb), np.float32)
+
+    cell_h = thumb // grid
+    cell_w = thumb // grid
+
+    # Per-cell affine maps: shift_L, scale_a, shift_a, scale_b, shift_b
+    # We build separate maps for each Lab channel
+    # Simple: match mean and std per cell (affine = scale + shift)
+    shift_L = np.zeros((grid, grid), np.float32)
+    scale_a = np.ones((grid,  grid), np.float32)
+    shift_a = np.zeros((grid, grid), np.float32)
+    scale_b = np.ones((grid,  grid), np.float32)
+    shift_b = np.zeros((grid, grid), np.float32)
+
+    for gy in range(grid):
+        for gx in range(grid):
+            y0, y1 = gy * cell_h, (gy + 1) * cell_h
+            x0, x1 = gx * cell_w, (gx + 1) * cell_w
+            m = mask_t[y0:y1, x0:x1].ravel()
+            if m.sum() < 4:
+                continue
+
+            def _fit(src_ch, tgt_ch):
+                s = src_ch[y0:y1, x0:x1].ravel()
+                t = tgt_ch[y0:y1, x0:x1].ravel()
+                mu_s = float(np.average(s, weights=m))
+                mu_t = float(np.average(t, weights=m))
+                std_s = float(np.sqrt(np.average((s - mu_s) ** 2, weights=m))) + 1e-6
+                std_t = float(np.sqrt(np.average((t - mu_t) ** 2, weights=m))) + 1e-6
+                sc = float(np.clip(std_t / std_s, 0.5, 2.0))
+                sh = mu_t - sc * mu_s
+                return sc, sh
+
+            shift_L[gy, gx]        = float(np.average(
+                tgt_lab[y0:y1, x0:x1, 0].ravel() - sw_lab[y0:y1, x0:x1, 0].ravel(),
+                weights=m))
+            scale_a[gy, gx], shift_a[gy, gx] = _fit(sw_lab[..., 1], tgt_lab[..., 1])
+            scale_b[gy, gx], shift_b[gy, gx] = _fit(sw_lab[..., 2], tgt_lab[..., 2])
+
+    # Upsample transform maps to full resolution
+    def _up(arr):
+        return cv2.resize(arr, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    sL = _up(shift_L)
+    sa, sha = _up(scale_a), _up(shift_a)
+    sb, shb = _up(scale_b), _up(shift_b)
+
+    # Apply spatially-varying transform in Lab space
+    sw_full_lab = cv2.cvtColor(swapped, cv2.COLOR_BGR2Lab).astype(np.float32)
+    out = sw_full_lab.copy()
+    out[..., 0] = np.clip(sw_full_lab[..., 0] + sL, 0, 100)
+    out[..., 1] = np.clip(sw_full_lab[..., 1] * sa + sha, -128, 127)
+    out[..., 2] = np.clip(sw_full_lab[..., 2] * sb + shb, -128, 127)
+
+    result = cv2.cvtColor(out.astype(np.uint8), cv2.COLOR_Lab2BGR)
+
+    # Soft blend: apply only in masked skin area to avoid artefacts on boundaries
+    if mask is not None:
+        alpha = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (21, 21), 5.0)[..., np.newaxis]
+        result = np.clip(
+            result.astype(np.float32) * alpha + swapped.astype(np.float32) * (1 - alpha),
+            0, 255,
+        ).astype(np.uint8)
+
+    return result
