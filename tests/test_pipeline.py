@@ -15,6 +15,25 @@ def load_def(name):
     return scope[name]
 
 
+class StageTimerTests(unittest.TestCase):
+    def test_marks_split_elapsed_time_by_stage(self):
+        from collections import deque
+        from types import SimpleNamespace
+        clock = iter([0.0, 0.010, 0.015, 1.0, 1.030, 1.035])
+        timer_cls = load_def('StageTimer')
+        timer_cls.__init__.__globals__.update(
+            deque=deque, time=SimpleNamespace(perf_counter=lambda: next(clock)))
+        timer = timer_cls()
+        for _ in range(2):
+            timer.start()
+            timer.mark('detect')
+            timer.mark('swap')
+        averages = timer.averages()
+        self.assertEqual(list(averages), ['detect', 'swap'])
+        self.assertAlmostEqual(averages['detect'], 20.0)
+        self.assertAlmostEqual(averages['swap'], 5.0)
+
+
 class MailboxTests(unittest.TestCase):
     def test_newest_replaces_oldest(self):
         put = load_def('put_latest')

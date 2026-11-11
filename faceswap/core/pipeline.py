@@ -41,6 +41,27 @@ def put_latest(mailbox: queue.Queue, item) -> None:
                 pass
 
 
+class StageTimer:
+    """Rolling wall-clock time per pipeline stage, in milliseconds."""
+    def __init__(self, window: int = 60):
+        self._window = window
+        self._times = {}
+        self._last = 0.0
+
+    def start(self) -> None:
+        self._last = time.perf_counter()
+
+    def mark(self, name: str) -> None:
+        now = time.perf_counter()
+        if name not in self._times:
+            self._times[name] = deque(maxlen=self._window)
+        self._times[name].append((now - self._last) * 1000)
+        self._last = now
+
+    def averages(self) -> dict:
+        return {name: sum(v) / len(v) for name, v in self._times.items()}
+
+
 def generate_profile_source_face(profile):
     """Run diffusion once at session setup, never in the frame loop."""
     from ..profile.synthesizer import generate_profile_source_face as generate
@@ -67,6 +88,8 @@ class SwapPipeline:
         self._inference_times = deque(maxlen=30)
         self._base_times = deque(maxlen=30)
         self._gpen_times = deque(maxlen=10)
+        self._timer = StageTimer()
+        self._timed_frames = 0
         self.last_inference_ms = 0.0
         self.gpen_skipped = 0
         self._last_frame_time = None
@@ -85,6 +108,11 @@ class SwapPipeline:
     @property
     def average_inference_ms(self) -> float:
         return sum(self._inference_times) / max(1, len(self._inference_times))
+
+    @property
+    def stage_ms(self) -> dict:
+        """Rolling average milliseconds per stage, in pipeline order."""
+        return self._timer.averages()
 
     def _reset_tracking(self):
         self._face_smoother.reset()
@@ -130,7 +158,10 @@ class SwapPipeline:
         if self._source_face is None:
             return frame_bgr
         started = time.perf_counter()
+        timer = self._timer
+        timer.start()
         target = detect_largest(frame_bgr)
+        timer.mark('detect')
         if target is None:
             self._reset_tracking()
             return frame_bgr
@@ -147,6 +178,7 @@ class SwapPipeline:
         # Extract only AFTER smoothing; these exact transforms also define paste-back.
         crop_swap = cv2.warpAffine(frame_bgr, M_swap, (256, 256), borderMode=cv2.BORDER_REFLECT)
         crop_ffhq = cv2.warpAffine(frame_bgr, M_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
+        timer.mark('align')
         if self._pixel_boost:
             # Pixel-boost: swap at 512px resolution via 4-patch tiling
             aligned = self._swapper.swap(crop_ffhq, self._source_face, pixel_boost=True)
@@ -159,6 +191,7 @@ class SwapPipeline:
         # Feathered coverage mask prevents hard boundary at the swap crop edge (fix #4).
         coverage_raw = cv2.warpAffine(np.ones((256, 256), np.float32), to_ffhq, (512, 512))
         coverage = feather_coverage(coverage_raw)
+        timer.mark('swap')
         gpen_ms = 0.0
         if self._should_enhance((time.perf_counter() - started) * 1000):
             # Ramp blend weight in over ~10 frames to avoid a pop at enable (fix #2).
@@ -171,6 +204,7 @@ class SwapPipeline:
             self._gpen_blend = max(0.0, self._gpen_blend - _GPEN_BLEND_STEP)
             enhanced = aligned
             self.gpen_skipped += 1
+        timer.mark('gpen')
         # Ownership masks come from the target: restoration may erase glasses
         # or change the mouth cavity before segmentation could preserve them.
         seg = self._parser.parse(crop_ffhq)
@@ -182,6 +216,7 @@ class SwapPipeline:
             occ = self._occluder.get_occlusion_mask(crop_ffhq, bisenet_seg=seg)
             swap_mask = swap_mask * (1.0 - occ)
         mask = swap_mask
+        timer.mark('parse')
         # Reinhard correction now applies only within the skin mask (fix C).
         result = reinhard_color_transfer(enhanced, crop_ffhq, mask=skin)
         # PCT-Net spatial color harmonization: handles directional lighting (Priority 4c).
@@ -189,23 +224,32 @@ class SwapPipeline:
         if self._use_pct:
             result = pct_harmonize(result, crop_ffhq, mask=skin)
         # Multiplicative shading correction in linear space, skin mask only (fix #7).
+        timer.mark('color')
         result = low_freq_shading_correction(result, crop_ffhq, sigma=20.0, skin_mask=skin)
+        timer.mark('shading')
         if self._quality == 'ultra':
             face_width = max(1, int(target.bbox[2] - target.bbox[0]))
             result = inject_skin_detail(result, crop_ffhq, skin, face_width, strength=0.20)
+            timer.mark('detail')
             result = apply_sss(result, skin, strength=0.20)
+            timer.mark('sss')
             # Use observed target detail instead of adding procedural skin texture.
             # transfer_specular returns (result, spec_mask) for temporal EMA (fix #9).
             result, self._spec_mask_prev = transfer_specular(
                 crop_ffhq, result, skin, prev_spec=self._spec_mask_prev)
+            timer.mark('specular')
         result = composite_mouth_interior(result, crop_ffhq, mouth)
+        timer.mark('mouth')
         # Camera degradation: match noise grain, sharpness, and motion blur of the
         # target camera feed. Applied before paste_back (last crop-space quality step).
         # flow_vec comes from TemporalEMA.get_face_flow — reuses its prev_gray store.
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         flow_vec = self._ema.get_face_flow(gray, target.bbox)
+        timer.mark('flow')
         result = match_camera_degradation(result, crop_ffhq, skin, flow_vec)
+        timer.mark('degrade')
         full, frame_mask = paste_back(frame_bgr, result, M_ffhq, mask=mask, return_mask=True)
+        timer.mark('paste')
         # BlinkGate: use 2d106det landmarks from buffalo_l; falls back gracefully to
         # is_blinking=False when landmark_2d_106 is None (e.g. on first frame).
         is_blinking = False
@@ -218,6 +262,11 @@ class SwapPipeline:
         temporal_mask = frame_mask * (1.0 - dynamic.astype(np.float32) / 255.0)
         full = self._ema.blend(full, gray, target.bbox, is_blinking=is_blinking,
                                face_mask=temporal_mask)
+        timer.mark('temporal')
+        self._timed_frames += 1
+        if self._timed_frames % 150 == 0:
+            logger.info('Stage ms: %s', ' '.join(
+                f'{name}={ms:.1f}' for name, ms in self.stage_ms.items()))
         self.last_inference_ms = (time.perf_counter() - started) * 1000
         self._inference_times.append(self.last_inference_ms)
         self._base_times.append(max(0.0, self.last_inference_ms - gpen_ms))

@@ -3,6 +3,7 @@ liveswap — Real-time face swap desktop application.
 Entry point.
 """
 from __future__ import annotations
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -122,6 +123,8 @@ def _check_models(app: QApplication) -> bool:
 # ---------------------------------------------------------------------------
 
 def main():
+    # Without this the pipeline's INFO-level stage timings are never shown.
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(message)s')
     app = QApplication(sys.argv)
     app.setApplicationName("liveswap")
     app.setOrganizationName("liveswap")
