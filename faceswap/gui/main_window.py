@@ -43,6 +43,7 @@ _DEFAULT_SETTINGS: dict = {
     "occlusion": False,
     "webrtc_enabled": False,
     "tensorrt": False,
+    "force_restoration": False,
     "last_photo": "",
 }
 
@@ -676,9 +677,12 @@ class _SettingsPage(QWidget):
          "Match lighting that differs across the face."),
         ("occlusion", "Occlusion detection",
          "Keep hands and objects in front of the face."),
+        ("force_restoration", "Always restore the face",
+         "Sharper face on every frame, even when that lowers the frame rate. "
+         "Off: restoration runs only when the graphics card keeps up."),
         ("tensorrt", "TensorRT for restoration",
-         "Experimental and untested. Needs TensorRT installed; the first start "
-         "builds an engine and takes several minutes."),
+         "About 2.5 times faster restoration. Needs the TensorRT package; the "
+         "first start builds an engine and takes about ten minutes."),
     ]
 
     def __init__(self, settings: dict, parent=None):
@@ -1002,6 +1006,7 @@ class MainWindow(QMainWindow):
                     pixel_boost=settings.get("pixel_boost", False),
                     use_pct=settings.get("pct_harmonize", False),
                     use_occluder=settings.get("occlusion", False),
+                    force_restoration=settings.get("force_restoration", False),
                 )
                 pipeline.set_source_face(source_face)
 
@@ -1074,7 +1079,9 @@ class MainWindow(QMainWindow):
             self._preview_overlay.show_frame(frame)
             if self._pipeline:
                 ms = self._pipeline.last_inference_ms
-                fps = 1000 / ms if ms > 0 else 0
+                # Stages run in parallel, so the rate is what reaches the output,
+                # not 1000 / (time spent on one frame).
+                fps = self._runner.output_fps if self._runner is not None else 0
                 self._preview_overlay.set_stats(f"{fps:.0f} fps  ·  {ms:.0f} ms")
                 slowest = sorted(self._pipeline.stage_ms.items(),
                                  key=lambda item: item[1], reverse=True)[:6]

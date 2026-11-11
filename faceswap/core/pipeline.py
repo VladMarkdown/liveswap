@@ -101,11 +101,39 @@ def generate_profile_source_face(profile):
     return generate(profile)
 
 
+class _Job:
+    """One frame's data as it moves between the pipeline stages."""
+
+    def __init__(self, frame: np.ndarray):
+        self.frame = frame
+        self.output = None      # set when the frame is passed through unprocessed
+        self.epoch = 0          # bumps whenever tracking restarts (face lost, new source)
+        self.work_ms = 0.0      # time spent inside stages, excluding queueing
+        self.gpen_ms = 0.0
+
+
 class SwapPipeline:
+    """The swap, as six stages that each own their state.
+
+    geometry    detect, smooth, align, swap, reproject
+    restore     optional face restoration (GPEN)
+    appearance  parse, masks, color, shading
+    skin        skin detail, scattering, highlights, mouth interior
+    camera      face motion, camera matching
+    composite   paste-back, temporal blend, label
+
+    process_frame() runs them one after another. AsyncPipelineRunner runs each
+    in its own thread, so throughput is set by the slowest stage instead of
+    their sum. A stage only touches its own state; tracking restarts travel
+    with the frame as an epoch number, which later stages notice and reset on.
+    """
+
+    _STAGES = ('geometry', 'restore', 'appearance', 'skin', 'camera', 'composite')
+
     def __init__(self, swapper, enhancer, parser, source_face=None,
                  quality: str = 'ultra', frame_budget_ms: float = 33.0,
                  pixel_boost: bool = False, use_pct: bool = False,
-                 use_occluder: bool = False):
+                 use_occluder: bool = False, force_restoration: bool = False):
         if frame_budget_ms <= 0:
             raise ValueError('frame_budget_ms must be positive')
         self._swapper = swapper
@@ -116,12 +144,16 @@ class SwapPipeline:
         self.frame_budget_ms = frame_budget_ms
         self._pixel_boost = pixel_boost
         self._use_pct = use_pct
+        # Restore every frame even when that lowers the frame rate.
+        self._force_restoration = force_restoration
         self._face_smoother = FaceParamSmoother()
         self._ema = TemporalEMA(base_weight=0.55)
+        # Face motion for the camera stage; its flow field is handed to _ema.
+        self._motion = TemporalEMA()
         self._inference_times = deque(maxlen=30)
         self._base_times = deque(maxlen=30)
         self._gpen_times = deque(maxlen=10)
-        self._timer = StageTimer()
+        self._timers = {stage: StageTimer() for stage in self._STAGES}
         self._timed_frames = 0
         self.last_inference_ms = 0.0
         self.gpen_skipped = 0
@@ -142,6 +174,13 @@ class SwapPipeline:
         # Last detected face, reused briefly when detection drops out.
         self._held_target = None
         self._missed = 0
+        # Tracking epoch: owned by the geometry stage, followed by the others.
+        self._epoch = 0
+        self._reset_pending = False
+        self._stage_epoch = dict.fromkeys(self._STAGES, 0)
+        # The swap-crop coverage mask depends only on the crop-to-crop transform,
+        # which is the same for every frame; (key, mask) of the last one built.
+        self._coverage_cache = None
         if enhancer is not None:
             # The first CUDA call is far slower than steady state; keep it out
             # of the restoration budget average.
@@ -153,20 +192,29 @@ class SwapPipeline:
 
     @property
     def stage_ms(self) -> dict:
-        """Rolling average milliseconds per stage, in pipeline order."""
-        return self._timer.averages()
+        """Rolling average milliseconds per step, in pipeline order."""
+        merged = {}
+        for stage in self._STAGES:
+            merged.update(self._timers[stage].averages())
+        return merged
 
-    def _reset_tracking(self):
+    def stage_totals_ms(self) -> dict:
+        """Rolling average milliseconds per stage (the units that run in parallel)."""
+        return {stage: sum(self._timers[stage].averages().values()) for stage in self._STAGES}
+
+    def _begin_epoch(self) -> None:
+        """Restart tracking. Called only from the geometry stage."""
+        self._epoch += 1
         self._face_smoother.reset()
-        self._ema.reset()
-        self._parser.reset()
-        self._blink_gate.reset()
         self._last_frame_time = None
-        self._enhance_enabled = True
-        self._gpen_blend = 0.0
-        self._spec_mask_prev = None
         self._held_target = None
         self._missed = 0
+
+    def _entered_new_epoch(self, stage: str, job: _Job) -> bool:
+        if self._stage_epoch[stage] == job.epoch:
+            return False
+        self._stage_epoch[stage] = job.epoch
+        return True
 
     def set_webrtc_streamer(self, streamer) -> None:
         self._webrtc = streamer
@@ -174,7 +222,8 @@ class SwapPipeline:
     def set_source_face(self, face) -> None:
         with self._lock:
             self._source_face = face
-            self._reset_tracking()
+            # Picked up by the geometry stage at its next frame.
+            self._reset_pending = True
 
     def set_profile(self, profile) -> None:
         if isinstance(profile, np.ndarray):
@@ -199,15 +248,62 @@ class SwapPipeline:
             self._enhance_enabled = True
         return self._enhance_enabled
 
-    def process_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
-        with self._lock:
-            return self._process_frame(frame_bgr)
+    def _should_enhance_parallel(self) -> bool:
+        """Restoration gate when the stages run in parallel.
 
-    def _process_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
-        if self._source_face is None:
-            return frame_bgr
+        Restoration is then a stage of its own, sharing the GPU with the
+        others, so what it costs is its own measured time under that load. It
+        runs only while that stays within 1.5 frame budgets; beyond that it
+        would set the frame rate. Same hysteresis as _should_enhance.
+        """
+        if self._enhancer is None:
+            return False
+        limit = self.frame_budget_ms * 1.5
+        gpen = sum(self._gpen_times) / max(1, len(self._gpen_times))
+        if gpen > limit:
+            self._enhance_enabled = False
+        elif gpen < limit * 0.85:
+            self._enhance_enabled = True
+        return self._enhance_enabled
+
+    def process_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """Run all stages on one frame, one after another."""
+        with self._lock:
+            job = self.stage_geometry(frame_bgr)
+            job = self.stage_restore(job)
+            job = self.stage_appearance(job)
+            job = self.stage_skin(job)
+            job = self.stage_camera(job)
+            return self.stage_composite(job)
+
+    def parallel_stages(self) -> list:
+        """The stages in order, as callables for one thread each."""
+        return [self.stage_geometry,
+                lambda job: self.stage_restore(job, parallel=True),
+                self.stage_appearance, self.stage_skin, self.stage_camera,
+                self.stage_composite]
+
+    @staticmethod
+    def passthrough(item) -> _Job:
+        """A job that outputs its frame unprocessed (used when a stage fails)."""
+        job = item if isinstance(item, _Job) else _Job(item)
+        job.output = job.frame
+        return job
+
+    # --- Stage 1: geometry -------------------------------------------------
+
+    def stage_geometry(self, frame_bgr: np.ndarray) -> _Job:
+        job = _Job(frame_bgr)
+        if self._reset_pending:
+            self._reset_pending = False
+            self._begin_epoch()
+        source_face = self._source_face
+        job.epoch = self._epoch
+        if source_face is None:
+            job.output = frame_bgr
+            return job
         started = time.perf_counter()
-        timer = self._timer
+        timer = self._timers['geometry']
         timer.start()
         target = detect_tracked(
             frame_bgr, None if self._held_target is None else self._held_target.bbox)
@@ -217,8 +313,10 @@ class SwapPipeline:
             # unprocessed frame and discarding all temporal state.
             self._missed += 1
             if self._held_target is None or self._missed > _MAX_HELD_FRAMES:
-                self._reset_tracking()
-                return frame_bgr
+                self._begin_epoch()
+                job.epoch = self._epoch
+                job.output = frame_bgr
+                return job
             target = self._held_target
         else:
             self._held_target = target
@@ -241,51 +339,87 @@ class SwapPipeline:
                                    borderMode=cv2.BORDER_REFLECT)
         crop_ffhq = cv2.warpAffine(frame_bgr, M_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
         timer.mark('align')
-        swapped = self._swapper.swap(crop_swap, self._source_face,
-                                     pixel_boost=self._pixel_boost)
+        swapped = self._swapper.swap(crop_swap, source_face, pixel_boost=self._pixel_boost)
         swap_h = np.vstack((M_swap, [0, 0, 1]))
         ffhq_h = np.vstack((M_ffhq, [0, 0, 1]))
         to_ffhq = (ffhq_h @ np.linalg.inv(swap_h))[:2]
-        aligned = cv2.warpAffine(swapped, to_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
+        job.aligned = cv2.warpAffine(swapped, to_ffhq, (512, 512), borderMode=cv2.BORDER_REFLECT)
         # Feathered coverage mask prevents hard boundary at the swap crop edge (fix #4).
-        coverage_raw = cv2.warpAffine(np.ones((swap_size, swap_size), np.float32),
-                                      to_ffhq, (512, 512))
-        coverage = feather_coverage(coverage_raw)
+        # Both crops come from the same landmarks, so to_ffhq is the same
+        # template-to-template transform on every frame: build the mask once.
+        key = (swap_size, tuple(np.round(to_ffhq, 2).ravel()))
+        if self._coverage_cache is None or self._coverage_cache[0] != key:
+            coverage_raw = cv2.warpAffine(np.ones((swap_size, swap_size), np.float32),
+                                          to_ffhq, (512, 512))
+            self._coverage_cache = (key, feather_coverage(coverage_raw))
+        job.coverage = self._coverage_cache[1]
         timer.mark('swap')
-        gpen_ms = 0.0
+        job.target, job.M_ffhq, job.crop_ffhq = target, M_ffhq, crop_ffhq
+        job.work_ms += (time.perf_counter() - started) * 1000
+        return job
+
+    # --- Stage 2: restoration ----------------------------------------------
+
+    def stage_restore(self, job: _Job, parallel: bool = False) -> _Job:
+        if job.output is not None:
+            return job
+        started = time.perf_counter()
+        timer = self._timers['restore']
+        timer.start()
+        if self._entered_new_epoch('restore', job):
+            self._enhance_enabled = True
+            self._gpen_blend = 0.0
         # Ramp the blend weight over ~10 frames in both directions (fix #2).
         # Restoration keeps running while the weight ramps down, so disabling
         # it fades out instead of popping.
-        wanted = self._should_enhance((time.perf_counter() - started) * 1000)
+        if self._force_restoration:
+            wanted = self._enhancer is not None
+        elif parallel:
+            wanted = self._should_enhance_parallel()
+        else:
+            wanted = self._should_enhance(job.work_ms)
         step = _GPEN_BLEND_STEP if wanted else -_GPEN_BLEND_STEP
         self._gpen_blend = min(_GPEN_BLEND_MAX, max(0.0, self._gpen_blend + step))
         if self._enhancer is not None and self._gpen_blend > 1e-6:
             before = time.perf_counter()
-            enhanced = self._enhancer.enhance_with_blend(aligned, blend=self._gpen_blend)
-            gpen_ms = (time.perf_counter() - before) * 1000
-            self._gpen_times.append(gpen_ms)
+            job.enhanced = self._enhancer.enhance_with_blend(job.aligned, blend=self._gpen_blend)
+            job.gpen_ms = (time.perf_counter() - before) * 1000
+            self._gpen_times.append(job.gpen_ms)
         else:
-            enhanced = aligned
+            job.enhanced = job.aligned
             self.gpen_skipped += 1
             if self.gpen_skipped % _GPEN_PROBE_FRAMES == 0:
                 # Cost samples only arrive while restoration runs. Drop the
                 # stale ones so the gate can re-enable and measure again.
                 self._gpen_times.clear()
         timer.mark('gpen')
+        job.work_ms += (time.perf_counter() - started) * 1000
+        return job
+
+    # --- Stage 3: appearance -----------------------------------------------
+
+    def stage_appearance(self, job: _Job) -> _Job:
+        if job.output is not None:
+            return job
+        started = time.perf_counter()
+        timer = self._timers['appearance']
+        timer.start()
+        if self._entered_new_epoch('appearance', job):
+            self._parser.reset()
+        crop_ffhq = job.crop_ffhq
         # Ownership masks come from the target: restoration may erase glasses
         # or change the mouth cavity before segmentation could preserve them.
         seg = self._parser.parse(crop_ffhq)
-        swap_mask = self._parser.build_swap_mask(seg, erosion_px=3, transition_px=10) * coverage
+        swap_mask = self._parser.build_swap_mask(seg, erosion_px=3, transition_px=10) * job.coverage
         skin = self._parser.get_skin_mask(seg)
         mouth = self._parser.get_mouth_interior_mask(seg)
         # Occlusion: subtract occluded regions from swap mask so original face shows through
         if self._occluder is not None:
             occ = self._occluder.get_occlusion_mask(crop_ffhq, bisenet_seg=seg)
             swap_mask = swap_mask * (1.0 - occ)
-        mask = swap_mask
         timer.mark('parse')
         # Reinhard correction now applies only within the skin mask (fix C).
-        result = reinhard_color_transfer(enhanced, crop_ffhq, mask=skin)
+        result = reinhard_color_transfer(job.enhanced, crop_ffhq, mask=skin)
         # PCT-Net spatial color harmonization: handles directional lighting (Priority 4c).
         # Reinhard strength reduced to 0.5 implicitly since PCT refines it.
         if self._use_pct:
@@ -294,8 +428,23 @@ class SwapPipeline:
         timer.mark('color')
         result = low_freq_shading_correction(result, crop_ffhq, sigma=20.0, skin_mask=skin)
         timer.mark('shading')
+        job.result, job.mask, job.skin, job.seg, job.mouth = result, swap_mask, skin, seg, mouth
+        job.work_ms += (time.perf_counter() - started) * 1000
+        return job
+
+    # --- Stage 4: skin -----------------------------------------------------
+
+    def stage_skin(self, job: _Job) -> _Job:
+        if job.output is not None:
+            return job
+        started = time.perf_counter()
+        timer = self._timers['skin']
+        timer.start()
+        if self._entered_new_epoch('skin', job):
+            self._spec_mask_prev = None
+        result, crop_ffhq, skin = job.result, job.crop_ffhq, job.skin
         if self._quality == 'ultra':
-            face_width = max(1, int(target.bbox[2] - target.bbox[0]))
+            face_width = max(1, int(job.target.bbox[2] - job.target.bbox[0]))
             result = inject_skin_detail(result, crop_ffhq, skin, face_width, strength=0.20)
             timer.mark('detail')
             result = apply_sss(result, skin, strength=0.20)
@@ -305,18 +454,52 @@ class SwapPipeline:
             result, self._spec_mask_prev = transfer_specular(
                 crop_ffhq, result, skin, prev_spec=self._spec_mask_prev)
             timer.mark('specular')
-        result = composite_mouth_interior(result, crop_ffhq, mouth)
+        job.result = composite_mouth_interior(result, crop_ffhq, job.mouth)
         timer.mark('mouth')
+        job.work_ms += (time.perf_counter() - started) * 1000
+        return job
+
+    # --- Stage 5: camera ---------------------------------------------------
+
+    def stage_camera(self, job: _Job) -> _Job:
+        if job.output is not None:
+            return job
+        started = time.perf_counter()
+        timer = self._timers['camera']
+        timer.start()
+        if self._entered_new_epoch('camera', job):
+            self._motion.reset()
         # Camera degradation: match noise grain, sharpness, and motion blur of the
         # target camera feed. Applied before paste_back (last crop-space quality step).
-        # flow_vec comes from TemporalEMA.get_face_flow — reuses its prev_gray store.
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        flow_vec = self._ema.get_face_flow(gray, target.bbox)
+        job.gray = cv2.cvtColor(job.frame, cv2.COLOR_BGR2GRAY)
+        flow_vec = self._motion.get_face_flow(job.gray, job.target.bbox)
+        # The composite stage blends against the same previous frame, so it can
+        # reuse this flow field instead of computing it again.
+        job.flow_cache = self._motion.flow_cache
+        self._motion.remember(job.gray)
         timer.mark('flow')
-        result = match_camera_degradation(result, crop_ffhq, skin, flow_vec)
+        job.result = match_camera_degradation(job.result, job.crop_ffhq, job.skin, flow_vec)
         timer.mark('degrade')
-        full, frame_mask = paste_back(frame_bgr, result, M_ffhq, mask=mask, return_mask=True)
+        job.work_ms += (time.perf_counter() - started) * 1000
+        return job
+
+    # --- Stage 6: composite ------------------------------------------------
+
+    def stage_composite(self, job: _Job) -> np.ndarray:
+        if job.output is not None:
+            return job.output
+        started = time.perf_counter()
+        timer = self._timers['composite']
+        timer.start()
+        if self._entered_new_epoch('composite', job):
+            self._ema.reset()
+            self._blink_gate.reset()
+        frame_bgr, target, M_ffhq, gray = job.frame, job.target, job.M_ffhq, job.gray
+        height, width = frame_bgr.shape[:2]
+        full, frame_mask = paste_back(frame_bgr, job.result, M_ffhq, mask=job.mask, return_mask=True)
         timer.mark('paste')
+        if job.flow_cache is not None and job.flow_cache[0] is gray:
+            self._ema.adopt_flow(job.flow_cache)
         # BlinkGate: use 2d106det landmarks from buffalo_l; falls back gracefully to
         # is_blinking=False when landmark_2d_106 is None (e.g. on first frame).
         is_blinking = False
@@ -324,7 +507,7 @@ class SwapPipeline:
         if left_eye is not None:
             ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) * 0.5
             is_blinking = self._blink_gate.update(ear)
-        dynamic = self._parser.get_region_mask(seg, [4, 5, 11, 12, 13])
+        dynamic = self._parser.get_region_mask(job.seg, [4, 5, 11, 12, 13])
         dynamic = cv2.warpAffine(dynamic, cv2.invertAffineTransform(M_ffhq), (width, height))
         temporal_mask = frame_mask * (1.0 - dynamic.astype(np.float32) / 255.0)
         full = self._ema.blend(full, gray, target.bbox, is_blinking=is_blinking,
@@ -335,9 +518,10 @@ class SwapPipeline:
         if self._timed_frames % 150 == 0:
             logger.info('Stage ms: %s', ' '.join(
                 f'{name}={ms:.1f}' for name, ms in self.stage_ms.items()))
-        self.last_inference_ms = (time.perf_counter() - started) * 1000
-        self._inference_times.append(self.last_inference_ms)
-        self._base_times.append(max(0.0, self.last_inference_ms - gpen_ms))
+        job.work_ms += (time.perf_counter() - started) * 1000
+        self.last_inference_ms = job.work_ms
+        self._inference_times.append(job.work_ms)
+        self._base_times.append(max(0.0, job.work_ms - job.gpen_ms))
         # WebRTC phone output — non-blocking push (Priority 5)
         if self._webrtc is not None and self._webrtc.is_active():
             self._webrtc.send_frame(full)
@@ -354,7 +538,14 @@ class _EmbeddingFace:
 
 
 class AsyncPipelineRunner:
-    """Capture, resize, inference and output workers with bounded latency."""
+    """Runs capture, every pipeline stage and output each in its own thread.
+
+    Camera frames go through latest-only mailboxes up to the first stage, so a
+    slow pipeline drops stale frames instead of lagging. Between stages a frame
+    is handed over and waited for: every frame that enters the pipeline is
+    finished, and the output rate is set by the slowest stage rather than by
+    the sum of all of them.
+    """
     def __init__(self, pipeline: SwapPipeline, output_callback: Callable,
                  target_width: int = 1280, target_height: int = 720):
         self._pipeline = pipeline
@@ -362,25 +553,42 @@ class AsyncPipelineRunner:
         self._target_w, self._target_h = target_width, target_height
         self._raw_q = queue.Queue(maxsize=1)
         self._pre_q = queue.Queue(maxsize=1)
+        self._stages = pipeline.parallel_stages()
+        self._stage_qs = [queue.Queue(maxsize=1) for _ in range(len(self._stages) - 1)]
         self._post_q = queue.Queue(maxsize=1)
         self._threads = []
         self._stop = threading.Event()
         self._cap = None
-        # Frames that failed in process_frame are passed through unprocessed;
+        # Frames that failed in a stage are passed through unprocessed;
         # these let the GUI say so instead of failing silently.
         self.error_count = 0
         self.last_error = None
+        self._output_times = deque(maxlen=30)
+
+    @property
+    def output_fps(self) -> float:
+        """Frames per second actually delivered to the output callback."""
+        times = list(self._output_times)
+        if len(times) < 2 or times[-1] <= times[0]:
+            return 0.0
+        return (len(times) - 1) / (times[-1] - times[0])
 
     def start(self, cap) -> None:
         if any(t.is_alive() for t in self._threads):
             raise RuntimeError('Pipeline already running')
         self._stop.clear()
-        for mailbox in (self._raw_q, self._pre_q, self._post_q):
+        mailboxes = [self._raw_q, self._pre_q, *self._stage_qs, self._post_q]
+        for mailbox in mailboxes:
             while not mailbox.empty():
                 mailbox.get_nowait()
+        self._output_times.clear()
         self._cap = cap
+        chain = [self._pre_q, *self._stage_qs, self._post_q]
+        stages = [(stage, chain[i], chain[i + 1]) for i, stage in enumerate(self._stages)]
         self._threads = [threading.Thread(target=fn, daemon=True) for fn in (
-            self._capture_thread, self._preprocess_thread, self._infer_thread, self._output_thread)]
+            self._capture_thread, self._preprocess_thread, self._output_thread)]
+        self._threads += [threading.Thread(target=self._stage_thread, args=stage, daemon=True)
+                          for stage in stages]
         for thread in self._threads:
             thread.start()
 
@@ -403,6 +611,15 @@ class AsyncPipelineRunner:
             except queue.Empty:
                 continue
         return STOP
+
+    def _hand_over(self, mailbox: queue.Queue, item) -> None:
+        """Pass an item to the next stage, waiting until it has taken the previous one."""
+        while not self._stop.is_set():
+            try:
+                mailbox.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                continue
 
     def _capture_thread(self):
         try:
@@ -428,28 +645,31 @@ class AsyncPipelineRunner:
         finally:
             put_latest(self._pre_q, STOP)
 
-    def _infer_thread(self):
+    def _stage_thread(self, stage, inbox, outbox):
         try:
             while True:
-                item = self._take(self._pre_q)
+                item = self._take(inbox)
                 if item is STOP:
                     break
                 try:
-                    result = self._pipeline.process_frame(item)
+                    result = stage(item)
                 except Exception as exc:
                     logger.exception('Frame processing failed')
                     self.error_count += 1
                     self.last_error = exc
-                    result = item
-                put_latest(self._post_q, result)
+                    result = self._pipeline.passthrough(item)
+                    if outbox is self._post_q:
+                        result = result.output
+                self._hand_over(outbox, result)
         finally:
-            put_latest(self._post_q, STOP)
+            put_latest(outbox, STOP)
 
     def _output_thread(self):
         while True:
             frame = self._take(self._post_q)
             if frame is STOP:
                 return
+            self._output_times.append(time.monotonic())
             try:
                 self._callback(frame)
             except Exception:

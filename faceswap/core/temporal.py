@@ -306,6 +306,21 @@ class TemporalEMA:
             return np.zeros(2, dtype=np.float32)
         return np.median(flow.reshape(-1, 2), axis=0).astype(np.float32)
 
+    def remember(self, gray: np.ndarray) -> None:
+        """Keep this frame as the previous one, for an instance used only for
+        get_face_flow() (blend() does this itself)."""
+        self._prev_gray = gray
+
+    @property
+    def flow_cache(self):
+        """The flow field computed for the current frame, to hand to another instance."""
+        return self._flow_cache
+
+    def adopt_flow(self, cache) -> None:
+        """Reuse a flow field another instance computed for the same pair of frames."""
+        if cache is not None:
+            self._flow_cache = cache
+
     def reset(self) -> None:
         self._prev_frame = None
         self._prev_gray = None

@@ -1,3 +1,4 @@
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -77,20 +78,30 @@ class ImageCoreTests(unittest.TestCase):
         np.testing.assert_array_equal(out, crop)
 
     def run_pipeline(self, detections, **options):
-        """Drive SwapPipeline.process_frame with fake models; returns (outputs, enhancer calls)."""
+        """Drive SwapPipeline.process_frame with fake models; returns (frame, outputs, enhancer calls)."""
+        from faceswap.core import pipeline as pipeline_module
+        pipe = self.make_pipeline(**options)
+        frame = np.random.default_rng(0).integers(0, 255, (720, 1280, 3), dtype=np.uint8)
+        queue = iter(detections)
+        with patch.object(pipeline_module, 'detect_tracked', lambda frame, prev: next(queue)):
+            outputs = [pipe.process_frame(frame) for _ in detections]
+        return frame, outputs, self._enhancer_calls[0]
+
+    def make_pipeline(self, **options):
+        """A SwapPipeline over fake models, with a source face set."""
         from faceswap.core import pipeline as pipeline_module
         from faceswap.core.parser import FaceParser
+        calls = self._enhancer_calls = [0]
 
         class Swapper:
             def swap(self, crop, face, pixel_boost=False):
                 return 255 - crop
 
         class Enhancer:
-            calls = 0
             def enhance(self, crop):
                 return crop
             def enhance_with_blend(self, crop, blend=0.8):
-                Enhancer.calls += 1
+                calls[0] += 1
                 return crop
 
         class Session:
@@ -105,11 +116,7 @@ class ImageCoreTests(unittest.TestCase):
 
         pipe = pipeline_module.SwapPipeline(Swapper(), Enhancer(), parser, **options)
         pipe.set_source_face(object())
-        frame = np.random.default_rng(0).integers(0, 255, (720, 1280, 3), dtype=np.uint8)
-        queue = iter(detections)
-        with patch.object(pipeline_module, 'detect_tracked', lambda frame, prev: next(queue)):
-            outputs = [pipe.process_frame(frame) for _ in detections]
-        return frame, outputs, Enhancer.calls
+        return pipe
 
     def fake_face(self):
         kps = aligner._ARCFACE_REF_112 * 3 + [450, 150]
@@ -146,6 +153,71 @@ class ImageCoreTests(unittest.TestCase):
         for held in outputs[1:6]:
             self.assertFalse(np.array_equal(held, frame))
         np.testing.assert_array_equal(outputs[6], frame)
+
+    def test_runner_processes_frames_through_parallel_stages(self):
+        import threading
+        from faceswap.core import pipeline as pipeline_module
+        frame, _, _ = self.run_pipeline([])
+        pipe = self.make_pipeline()
+        face = self.fake_face()
+        delivered, enough = [], threading.Event()
+
+        class Camera:
+            # Paced like a real camera: an instant end-of-stream would overtake
+            # the frames still waiting in the latest-only mailboxes.
+            def read(self):
+                time.sleep(0.01)
+                return True, frame
+            def release(self):
+                pass
+
+        def deliver(out):
+            delivered.append(out)
+            if len(delivered) >= 3:
+                enough.set()
+
+        with patch.object(pipeline_module, 'detect_tracked', lambda frame, prev: face):
+            runner = pipeline_module.AsyncPipelineRunner(pipe, deliver)
+            runner.start(Camera())
+            self.assertTrue(enough.wait(timeout=20), 'no output from the runner')
+            runner.stop()
+            runner.join()
+        self.assertEqual(runner.error_count, 0, repr(runner.last_error))
+        self.assertEqual(delivered[-1].shape, frame.shape)
+        self.assertFalse(np.array_equal(delivered[-1], frame))
+        self.assertEqual(set(pipe.stage_totals_ms()), {'geometry', 'restore', 'appearance', 'skin', 'camera', 'composite'})
+
+    def test_runner_passes_a_frame_through_when_a_stage_fails(self):
+        import threading
+        from faceswap.core import pipeline as pipeline_module
+        frame, _, _ = self.run_pipeline([])
+        pipe = self.make_pipeline()
+        delivered, got = [], threading.Event()
+
+        class Camera:
+            # Paced like a real camera: an instant end-of-stream would overtake
+            # the frames still waiting in the latest-only mailboxes.
+            def read(self):
+                time.sleep(0.01)
+                return True, frame
+            def release(self):
+                pass
+
+        def boom(frame, prev):
+            raise RuntimeError('detector exploded')
+
+        def deliver(out):
+            delivered.append(out)
+            got.set()
+
+        with patch.object(pipeline_module, 'detect_tracked', boom):
+            runner = pipeline_module.AsyncPipelineRunner(pipe, deliver)
+            runner.start(Camera())
+            self.assertTrue(got.wait(timeout=20))
+            runner.stop()
+            runner.join()
+        self.assertGreater(runner.error_count, 0)
+        np.testing.assert_array_equal(delivered[0], frame)
 
     def test_pct_harmonize_keeps_matching_bright_face_unchanged(self):
         face = np.full((512, 512, 3), 220, np.uint8)
