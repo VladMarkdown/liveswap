@@ -84,18 +84,51 @@ class Arc2FaceSynthesizer:
 
 
 def generate_profile_source_face(profile):
-    """Generate once with the profile LoRA and detect a real source Face."""
+    """
+    Generate a source face for the live swap session (Fix 3).
+
+    If profile.arc2face_embedding is set (antelopev2 space), it is used directly
+    as the Arc2Face conditioning — the correct identity space for the model.
+    Otherwise falls back to profile.embedding (buffalo_l) as a proxy.
+
+    Generates up to 5 images, re-embeds each with buffalo_l, and returns the
+    face whose embedding has the highest cosine similarity to profile.embedding.
+    This is an iterative best-match refinement that works with ONNX models.
+    """
     from faceswap.core.detector import detect_largest
+
+    # Choose conditioning: arc2face space (correct) > buffalo_l (approximate proxy)
+    arc2face_emb = getattr(profile, 'arc2face_embedding', None)
+    cond_embedding = arc2face_emb if arc2face_emb is not None else profile.embedding
+
+    # L2-normalize target embedding for similarity comparison
+    tgt_norm = profile.embedding / (np.linalg.norm(profile.embedding) + 1e-9)
+
     synthesizer = Arc2FaceSynthesizer()
     try:
         synthesizer._load_pipeline()
         if profile.lora_path is not None:
             synthesizer._pipeline.load_lora_weights(str(profile.lora_path))
-        for _ in range(3):
-            image = synthesizer.generate_images(profile.embedding)[0]
-            face = detect_largest(np.asarray(image.convert("RGB"))[:, :, ::-1].copy())
-            if face is not None:
-                return face
-        raise ValueError("Arc2Face generated no detectable source face; retry loading the profile")
+
+        best_face = None
+        best_sim = -1.0
+
+        for _ in range(5):
+            image = synthesizer.generate_images(cond_embedding)[0]
+            frame = np.asarray(image.convert("RGB"))[:, :, ::-1].copy()
+            face = detect_largest(frame)
+            if face is None:
+                continue
+            # Re-embed with buffalo_l; pick the best match to profile.embedding
+            sim = float(np.dot(face.normed_embedding, tgt_norm))
+            if sim > best_sim:
+                best_sim = sim
+                best_face = face
+
+        if best_face is None:
+            raise ValueError(
+                "Arc2Face generated no detectable source face; retry loading the profile"
+            )
+        return best_face
     finally:
         synthesizer.close()
