@@ -490,6 +490,9 @@ class SwapPipeline:
     def stage_composite(self, job: _Job) -> np.ndarray:
         if job.output is not None:
             self.last_pair = (job.frame, job.output)
+            # Unprocessed frames go to the phone too, or its picture would freeze.
+            if self._webrtc is not None and self._webrtc.is_active():
+                self._webrtc.send_frame(job.output)
             return job.output
         started = time.perf_counter()
         timer = self._timers['composite']

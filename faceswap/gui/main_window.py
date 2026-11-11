@@ -672,7 +672,8 @@ class _SettingsPage(QWidget):
         ("vcam_enabled", "Virtual camera",
          "Send output to the DirectShow Softcam device."),
         ("webrtc_enabled", "Stream to phone",
-         "Serve the output over WebRTC on port 8765."),
+         "Show a QR code while running; a phone on the same Wi-Fi opens it and "
+         "plays the output in its browser."),
         ("pixel_boost", "Pixel boost",
          "Swap at 512 px in four passes. Sharper, about four times the swap cost."),
         ("pct_harmonize", "Local color harmonization",
@@ -789,7 +790,33 @@ class _PreviewOverlay(QWidget):
         self._video.setAlignment(Qt.AlignCenter)
         self._video.setMinimumSize(320, 180)
         self._video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        body.addWidget(self._video, stretch=1)
+        row = QHBoxLayout()
+        row.setSpacing(16)
+        row.addWidget(self._video, stretch=1)
+
+        # Phone link: a QR code for the WebRTC page, shown only while it is served.
+        self._phone = QFrame()
+        self._phone.setObjectName("card")
+        self._phone.setFixedWidth(232)
+        phone = QVBoxLayout(self._phone)
+        phone.setContentsMargins(16, 16, 16, 16)
+        phone.setSpacing(8)
+        phone.addWidget(_label("Watch on a phone", "row_title"))
+        self._qr = _label("", "thumb")
+        self._qr.setFixedSize(200, 200)
+        self._qr.setAlignment(Qt.AlignCenter)
+        phone.addWidget(self._qr)
+        phone.addWidget(_label("Scan with the phone's camera. The phone must be on the "
+                               "same Wi-Fi as this PC.", "muted", wrap=True))
+        self._phone_url = _label("", "muted", wrap=True)
+        self._phone_url.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        phone.addWidget(self._phone_url)
+        self._phone_viewers = _label("", "muted")
+        phone.addWidget(self._phone_viewers)
+        phone.addStretch()
+        self._phone.hide()
+        row.addWidget(self._phone)
+        body.addLayout(row, stretch=1)
         self._stages = _label("", "muted", wrap=True)
         body.addWidget(self._stages)
         outer.addLayout(body, stretch=1)
@@ -800,6 +827,26 @@ class _PreviewOverlay(QWidget):
 
     def set_stats(self, text: str) -> None:
         self._stats.setText(text)
+
+    def show_phone_link(self, url: str) -> None:
+        """Show the QR code for the phone page (the plain link if qrcode is missing)."""
+        self._phone_url.setText(url)
+        try:
+            import qrcode
+            image = qrcode.make(url, border=2).convert("RGB")
+            pixels = np.ascontiguousarray(np.asarray(image)[:, :, ::-1])
+            self._qr.setPixmap(_pixmap_from_bgr(pixels).scaled(
+                196, 196, Qt.KeepAspectRatio, Qt.FastTransformation))
+        except Exception:
+            self._qr.setText("QR unavailable.\nType the link below.")
+        self._phone.show()
+
+    def set_phone_viewers(self, count: int) -> None:
+        self._phone_viewers.setText(
+            "No phone connected yet" if count == 0 else f"Connected: {count}")
+
+    def hide_phone_link(self) -> None:
+        self._phone.hide()
 
     def set_stages(self, text: str) -> None:
         self._stages.setText(text)
@@ -1043,6 +1090,8 @@ class MainWindow(QMainWindow):
         self._starting = False
         self._shown_errors = 0
         self._capture_end_shown = False
+        self._webrtc = None
+        self._preview_overlay.hide_phone_link()
         self.statusBar().showMessage("Running")
 
         # Optional recording of this session, switched on in Settings.
@@ -1071,11 +1120,13 @@ class MainWindow(QMainWindow):
             try:
                 from faceswap.streaming.webrtc_output import WebRTCStreamer
                 streamer = WebRTCStreamer()
-                streamer.start()
+                streamer.start()          # raises if the port is taken or aiortc is missing
                 pipeline.set_webrtc_streamer(streamer)
-                self.statusBar().showMessage(f"WebRTC: {streamer.local_url()}")
+                self._webrtc = streamer
+                self._preview_overlay.show_phone_link(streamer.local_url())
             except Exception as e:
-                self.statusBar().showMessage(f"WebRTC unavailable: {e}")
+                logging.getLogger(__name__).exception("WebRTC unavailable")
+                self.statusBar().showMessage(f"Phone stream unavailable: {e}")
 
         from faceswap.core.pipeline import AsyncPipelineRunner
         self._runner = AsyncPipelineRunner(
@@ -1121,6 +1172,9 @@ class MainWindow(QMainWindow):
                                  key=lambda item: item[1], reverse=True)[:6]
                 self._preview_overlay.set_stages(
                     "   ".join(f"{name} {stage_ms:.0f} ms" for name, stage_ms in slowest))
+        webrtc = getattr(self, "_webrtc", None)
+        if webrtc is not None:
+            self._preview_overlay.set_phone_viewers(webrtc.viewers)
         # Frames that fail in the pipeline are passed through unprocessed; say so.
         runner = self._runner
         if runner is not None and runner.capture_ended and not self._capture_end_shown:
@@ -1171,6 +1225,11 @@ class MainWindow(QMainWindow):
         if recorder is not None:
             recorder.close()
             self._recorder = None
+        # Free the port, or the next start cannot serve the phone page.
+        webrtc = getattr(self, '_webrtc', None)
+        if webrtc is not None:
+            webrtc.stop()
+            self._webrtc = None
         self._runner = None
         self._pipeline = None
         self._running = False

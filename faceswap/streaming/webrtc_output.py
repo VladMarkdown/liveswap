@@ -1,26 +1,27 @@
 """
-WebRTC phone output via aiortc + aiohttp.
+WebRTC output to a phone (or any) browser on the same network, via aiortc + aiohttp.
 
-Starts a local HTTP server on port 8765. Opening http://localhost:8765 on the
-phone's browser shows the live swapped face stream via WebRTC.
-
-Usage:
     streamer = WebRTCStreamer()
-    streamer.start()
-    # ... in the frame loop:
-    streamer.send_frame(bgr_array)
-    # ... on close:
+    streamer.start()                 # raises if the server cannot start
+    url = streamer.local_url()       # http://<lan-ip>:8765/?k=<token>, for a QR code
+    streamer.send_frame(bgr_array)   # from the frame loop, any thread
     streamer.stop()
 
-Requires:  pip install aiortc aiohttp
+The page at that URL makes a receive-only WebRTC connection back to this
+server and plays the video. Signalling is one HTTP POST; media goes directly
+between the two devices over UDP, so they must be able to reach each other
+(same Wi-Fi, no client isolation) and the PC's firewall must allow Python.
 
-The HTML page served handles the WebRTC offer/answer handshake automatically.
+Requires:  pip install aiortc aiohttp
 """
 from __future__ import annotations
+
 import asyncio
-import gc
+import hmac
+import json
 import logging
-import queue
+import secrets
+import socket
 import threading
 from typing import Optional
 
@@ -29,9 +30,8 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _PORT = 8765
-_ICE_SERVERS = []  # local LAN only — no STUN/TURN needed
 
-# Minimal HTML page served to the phone browser
+# Page served to the browser. __TOKEN__ is replaced with the access token.
 _INDEX_HTML = """<!DOCTYPE html>
 <html>
 <head>
@@ -39,39 +39,71 @@ _INDEX_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>liveswap</title>
 <style>
-body { margin:0; background:#111; display:flex; align-items:center;
-       justify-content:center; height:100vh; }
-video { max-width:100%; max-height:100vh; }
-#status { color:#aaa; font-family:sans-serif; font-size:14px; text-align:center; }
+html, body { margin:0; height:100%; background:#000; }
+body { display:flex; flex-direction:column; align-items:center; justify-content:center; }
+video { max-width:100%; max-height:100%; }
+#status { position:fixed; left:0; right:0; bottom:12px; color:#aaa;
+          font-family:sans-serif; font-size:14px; text-align:center; }
 </style>
 </head>
 <body>
-<div>
-  <video id="v" autoplay playsinline muted></video>
-  <p id="status">Connecting…</p>
-</div>
+<video id="v" autoplay playsinline muted></video>
+<p id="status">Connecting…</p>
 <script>
+const video = document.getElementById('v');
+const statusLine = document.getElementById('status');
+let pc = null;
+let retry = null;
+
+function say(text) { statusLine.textContent = text; }
+
+function reconnectSoon() {
+  if (retry) return;
+  retry = setTimeout(() => { retry = null; start(); }, 2000);
+}
+
+// aiortc does not trickle candidates, so send the offer once gathering is done.
+function gatheringDone(conn) {
+  return new Promise(resolve => {
+    if (conn.iceGatheringState === 'complete') return resolve();
+    const timer = setTimeout(resolve, 2000);
+    conn.addEventListener('icegatheringstatechange', () => {
+      if (conn.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); }
+    });
+  });
+}
+
 async function start() {
-  const pc = new RTCPeerConnection({iceServers: []});
-  pc.ontrack = e => {
-    document.getElementById('v').srcObject = e.streams[0];
-    document.getElementById('status').textContent = 'Live';
+  if (pc) { pc.close(); }
+  say('Connecting…');
+  const conn = pc = new RTCPeerConnection({iceServers: []});
+  conn.ontrack = e => {
+    video.srcObject = e.streams[0] || new MediaStream([e.track]);
+    video.play().catch(() => {});
   };
-  pc.oniceconnectionstatechange = () => {
-    if (pc.iceConnectionState === 'disconnected') {
-      document.getElementById('status').textContent = 'Disconnected — reload to reconnect';
+  conn.onconnectionstatechange = () => {
+    if (conn !== pc) return;
+    if (conn.connectionState === 'connected') say('');
+    if (conn.connectionState === 'failed' || conn.connectionState === 'disconnected') {
+      say('Connection lost. Reconnecting…');
+      reconnectSoon();
     }
   };
-  pc.addTransceiver('video', {direction: 'recvonly'});
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  const r = await fetch('/offer', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({sdp: offer.sdp, type: offer.type})
-  });
-  const answer = await r.json();
-  await pc.setRemoteDescription(answer);
+  try {
+    conn.addTransceiver('video', {direction: 'recvonly'});
+    await conn.setLocalDescription(await conn.createOffer());
+    await gatheringDone(conn);
+    const reply = await fetch('/offer?k=__TOKEN__', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sdp: conn.localDescription.sdp, type: conn.localDescription.type})
+    });
+    if (!reply.ok) throw new Error('server said ' + reply.status);
+    await conn.setRemoteDescription(await reply.json());
+  } catch (err) {
+    say('Cannot connect (' + err.message + '). Retrying…');
+    reconnectSoon();
+  }
 }
 start();
 </script>
@@ -80,182 +112,171 @@ start();
 """
 
 
-class _LiveVideoTrack:
-    """aiortc VideoStreamTrack that sources frames from a thread-safe queue."""
+def _make_track(streamer: "WebRTCStreamer"):
+    """A video track that sends the streamer's latest frame at a steady 30 fps."""
+    from aiortc import VideoStreamTrack
+    from av import VideoFrame
 
-    def __init__(self):
+    class LatestFrameTrack(VideoStreamTrack):
+        async def recv(self):
+            # next_timestamp() sleeps to keep 30 fps; without it the sender
+            # spins and floods the connection.
+            pts, time_base = await self.next_timestamp()
+            bgr = streamer._latest
+            if bgr is None:
+                bgr = streamer._blank
+            frame = VideoFrame.from_ndarray(np.ascontiguousarray(bgr), format="bgr24")
+            frame.pts = pts
+            frame.time_base = time_base
+            return frame
+
+    return LatestFrameTrack()
+
+
+def lan_address() -> str:
+    """The address other devices on the local network reach this PC at.
+
+    Asks the OS which interface it would use for an outside address; no packet
+    is sent. gethostbyname(hostname) often returns a virtual adapter instead.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))      # TEST-NET-1: never routed, never contacted
+        return probe.getsockname()[0]
+    except OSError:
         try:
-            from aiortc import VideoStreamTrack
-            from av import VideoFrame
-            self._VideoFrame = VideoFrame
-            self._base_cls = VideoStreamTrack
-        except ImportError:
-            raise ImportError("aiortc / av not installed: pip install aiortc")
-
-        class _Track(self._base_cls):
-            kind = "video"
-            _frame_q: queue.Queue
-
-            async def recv(self):
-                try:
-                    bgr = self._frame_q.get_nowait()
-                except queue.Empty:
-                    bgr = None
-                if bgr is None:
-                    # Return last or blank frame
-                    rgb = np.zeros((720, 1280, 3), np.uint8)
-                else:
-                    rgb = bgr[:, :, ::-1]
-                frame = self._frame_cls.from_ndarray(rgb, format="rgb24")
-                pts, timebase = await self._next_pts()
-                frame.pts = pts
-                frame.time_base = timebase
-                return frame
-
-        self._TrackCls = _Track
-        self._track = None
-        self._frame_q: queue.Queue = queue.Queue(maxsize=1)
-
-    def build(self):
-        from av import VideoFrame
-        track = self._TrackCls()
-        track._frame_q = self._frame_q
-        track._frame_cls = VideoFrame
-        # Monkey-patch _next_pts from the base class method
-        async def _next_pts(self_inner=track):
-            pts = getattr(self_inner, '_pts', 0)
-            self_inner._pts = pts + 1
-            from fractions import Fraction
-            return pts, Fraction(1, 30)
-        track._next_pts = _next_pts
-        self._track = track
-        return track
-
-    def push(self, bgr: np.ndarray) -> None:
-        try:
-            self._frame_q.put_nowait(bgr)
-        except queue.Full:
-            try:
-                self._frame_q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._frame_q.put_nowait(bgr)
-            except queue.Full:
-                pass
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+    finally:
+        probe.close()
 
 
 class WebRTCStreamer:
-    """
-    Starts a local HTTP server on port 8765 and streams the swapped face
-    to any browser that opens http://<local-ip>:8765.
-    """
+    """Serves a page on the local network that plays the frames given to send_frame()."""
 
     def __init__(self, port: int = _PORT):
         self._port = port
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
-        self._site = None
-        self._track: Optional[_LiveVideoTrack] = None
+        self._stop_event: Optional[asyncio.Event] = None
+        self._ready = threading.Event()
+        self._error: Optional[BaseException] = None
         self._active = False
+        # Every viewer's track reads this; a queue would hand each frame to one viewer only.
+        self._latest: Optional[np.ndarray] = None
+        self._blank = np.zeros((720, 1280, 3), np.uint8)
+        # Without it anyone on the network who guesses the port could watch.
+        self._token = secrets.token_urlsafe(9)
+        self.viewers = 0
 
-    def start(self) -> None:
+    def start(self, timeout: float = 10.0) -> None:
+        """Start the server and wait until it is listening. Raises if it cannot start."""
         if self._active:
             return
-        self._track = _LiveVideoTrack()
-        self._active = True
+        self._ready.clear()
+        self._error = None
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="webrtc")
         self._thread.start()
+        if not self._ready.wait(timeout):
+            raise RuntimeError("WebRTC server did not start in time")
+        if self._error is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+            raise RuntimeError(f"WebRTC server failed to start: {self._error}") from self._error
+        self._active = True
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._serve())
-        except Exception:
+        except BaseException as exc:      # reported to start() through _error
             logger.exception("WebRTC server error")
+            self._error = exc
         finally:
+            self._ready.set()
             self._loop.close()
 
     async def _serve(self) -> None:
-        try:
-            from aiohttp import web
-            from aiortc import RTCPeerConnection, RTCSessionDescription
-            import json
-        except ImportError as e:
-            logger.error("WebRTC deps missing: %s — pip install aiortc aiohttp", e)
-            return
+        from aiohttp import web
+        from aiortc import RTCPeerConnection, RTCSessionDescription
 
+        self._stop_event = asyncio.Event()
         pcs: set = set()
 
-        async def _index(request):
-            return web.Response(text=_INDEX_HTML, content_type="text/html")
+        def allowed(request) -> bool:
+            return hmac.compare_digest(request.query.get("k", ""), self._token)
 
-        async def _offer(request):
+        async def index(request):
+            if not allowed(request):
+                return web.Response(status=403, text="Open the link from the QR code.")
+            return web.Response(text=_INDEX_HTML.replace("__TOKEN__", self._token),
+                                content_type="text/html")
+
+        async def offer(request):
+            if not allowed(request):
+                return web.Response(status=403, text="forbidden")
             params = await request.json()
-            offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
             pc = RTCPeerConnection()
             pcs.add(pc)
 
             @pc.on("connectionstatechange")
             async def on_state():
+                logger.info("WebRTC viewer %s", pc.connectionState)
                 if pc.connectionState in ("failed", "closed"):
                     await pc.close()
                     pcs.discard(pc)
+                self.viewers = sum(1 for p in pcs if p.connectionState == "connected")
 
-            video_track = self._track.build()
-            pc.addTrack(video_track)
-            await pc.setRemoteDescription(offer)
-            answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-            return web.Response(
-                content_type="application/json",
-                text=json.dumps({"sdp": pc.localDescription.sdp,
-                                 "type": pc.localDescription.type}),
-            )
+            pc.addTrack(_make_track(self))
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=params["sdp"], type=params["type"]))
+            await pc.setLocalDescription(await pc.createAnswer())
+            return web.json_response({"sdp": pc.localDescription.sdp,
+                                      "type": pc.localDescription.type})
 
         app = web.Application()
-        app.router.add_get("/", _index)
-        app.router.add_post("/offer", _offer)
+        app.router.add_get("/", index)
+        app.router.add_post("/offer", offer)
         runner = web.AppRunner(app)
         await runner.setup()
-        self._site = web.TCPSite(runner, "0.0.0.0", self._port)
-        await self._site.start()
-        logger.info("WebRTC server listening on http://0.0.0.0:%d", self._port)
+        await web.TCPSite(runner, "0.0.0.0", self._port).start()
+        logger.info("WebRTC server listening on port %d", self._port)
+        self._ready.set()
 
-        # Keep running until stopped
-        while self._active:
-            await asyncio.sleep(1)
+        await self._stop_event.wait()
 
+        await asyncio.gather(*(pc.close() for pc in list(pcs)), return_exceptions=True)
         await runner.cleanup()
-        for pc in list(pcs):
-            await pc.close()
+        self.viewers = 0
 
     def send_frame(self, bgr_array: np.ndarray) -> None:
-        """Push a BGR frame to all connected WebRTC clients."""
-        if self._track is not None and self._active:
-            self._track.push(bgr_array)
+        """Make this BGR frame the one every connected viewer receives next."""
+        if self._active:
+            self._latest = bgr_array
 
     def is_active(self) -> bool:
         return self._active
 
     def stop(self) -> None:
         self._active = False
+        loop, stop_event = self._loop, self._stop_event
+        if loop is not None and stop_event is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(stop_event.set)
+            except RuntimeError:
+                pass                       # the loop closed between the check and the call
         if self._thread is not None:
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=5.0)
         self._thread = None
         self._loop = None
-        gc.collect()
+        self._stop_event = None
+        self._latest = None
 
     def local_url(self) -> str:
-        """Return the URL to display / generate QR code for."""
-        import socket
-        hostname = socket.gethostname()
-        try:
-            ip = socket.gethostbyname(hostname)
-        except Exception:
-            ip = "127.0.0.1"
-        return f"http://{ip}:{self._port}"
+        """The link to open on the phone; put this in the QR code."""
+        return f"http://{lan_address()}:{self._port}/?k={self._token}"
 
     def __enter__(self):
         self.start()
