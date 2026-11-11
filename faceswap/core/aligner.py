@@ -76,19 +76,29 @@ def paste_back(frame_bgr: np.ndarray, enhanced: np.ndarray,
     if mask is not None and mask.dtype == np.uint8:
         crop_mask /= 255.0
     crop_mask = np.clip(crop_mask, 0, 1)
-    frame_mask = cv2.warpAffine(crop_mask, inverse, (w, h),
-                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    points = cv2.findNonZero((frame_mask > 0).astype(np.uint8))
-    if points is None:
+    frame_mask = np.zeros((h, w), np.float32)
+    # Locate the mask in crop space and project its box into the frame, so only
+    # that region of the frame is warped and blended.
+    bx, by, bw, bh = cv2.boundingRect((crop_mask > 0).astype(np.uint8))
+    if bw == 0:
         result = frame_bgr.copy()
         return (result, frame_mask) if return_mask else result
-    x, y, width, height = cv2.boundingRect(points)
-    # Gaussian down/up sampling spreads support by < 4 * 2**levels pixels.
-    padding = 128
-    x0, y0 = max(0, x - padding), max(0, y - padding)
-    x1, y1 = min(w, x + width + padding), min(h, y + height + padding)
+    corners = np.array([[bx, by], [bx + bw, by], [bx, by + bh], [bx + bw, by + bh]], np.float64)
+    corners = corners @ inverse[:, :2].T + inverse[:, 2]
+    # A five-level pyramid spreads the mask by about 2 * 2**levels pixels.
+    padding = 66
+    x0 = max(0, int(np.floor(corners[:, 0].min())) - padding)
+    y0 = max(0, int(np.floor(corners[:, 1].min())) - padding)
+    x1 = min(w, int(np.ceil(corners[:, 0].max())) + padding)
+    y1 = min(h, int(np.ceil(corners[:, 1].max())) + padding)
+    if x1 <= x0 or y1 <= y0:
+        result = frame_bgr.copy()
+        return (result, frame_mask) if return_mask else result
     local_inverse = inverse.copy()
     local_inverse[:, 2] -= (x0, y0)
+    frame_mask[y0:y1, x0:x1] = cv2.warpAffine(
+        crop_mask, local_inverse, (x1 - x0, y1 - y0),
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     warped = cv2.warpAffine(enhanced, local_inverse, (x1 - x0, y1 - y0),
                             borderMode=cv2.BORDER_REPLICATE)
     result = frame_bgr.copy()

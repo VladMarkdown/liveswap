@@ -8,14 +8,27 @@ import onnxruntime as ort
 logger = logging.getLogger(__name__)
 
 
-def create_session(model_path: str | Path) -> ort.InferenceSession:
-    """Create an FP32 session on the best available provider and report which one runs.
+def create_session(model_path: str | Path, tensorrt_fp16: bool = False) -> ort.InferenceSession:
+    """Create a session on the best available provider and report which one runs.
+
+    Sessions are FP32 unless tensorrt_fp16 is set and the TensorRT provider is
+    available; only models that tolerate FP16 (GPEN) should ask for it. The
+    first TensorRT run builds an engine, which takes minutes; it is cached in
+    a trt_cache folder next to the model.
 
     ONNX Runtime silently falls back to CPU when the CUDA/cuDNN libraries cannot be
     loaded, so the active provider is logged and a CPU fallback is a warning.
     """
     available = ort.get_available_providers()
     providers = []
+    if tensorrt_fp16 and "TensorrtExecutionProvider" in available:
+        cache = Path(model_path).parent / "trt_cache"
+        cache.mkdir(exist_ok=True)
+        providers.append(("TensorrtExecutionProvider", {
+            "trt_fp16_enable": True,
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": str(cache),
+        }))
     if "CUDAExecutionProvider" in available:
         # Grow the arena by what is requested, not by doubling: several sessions
         # share one 8 GB card.

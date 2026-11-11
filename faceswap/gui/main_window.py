@@ -1,7 +1,8 @@
 """
-Main application window (PySide6) — simplified UX for non-technical users.
+Main application window (PySide6).
 
-No tabs at startup. Welcome screen → choose mode → work.
+Layout: a fixed sidebar (Live, Profiles, Settings) beside a stack of pages.
+Every page has a header row with its title and primary action, then content.
 All long-running ops run in background threads via WorkerSignals.
 Settings persisted to ~/.liveswap/settings.json.
 
@@ -15,18 +16,17 @@ from __future__ import annotations
 import gc
 import json
 import threading
-import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, Slot, QSize
-from PySide6.QtGui import QImage, QPixmap, QFont, QPainter, QColor
+from PySide6.QtGui import QImage, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFileDialog, QProgressBar, QCheckBox, QLineEdit,
     QStatusBar, QSizePolicy, QStackedWidget, QScrollArea, QFrame,
-    QDialog, QFormLayout, QSlider, QGroupBox, QToolButton,
+    QButtonGroup,
 )
 
 # ---------------------------------------------------------------------------
@@ -42,10 +42,16 @@ _DEFAULT_SETTINGS: dict = {
     "pct_harmonize": False,
     "occlusion": False,
     "webrtc_enabled": False,
+    "tensorrt": False,
     "last_photo": "",
 }
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
+
+_CONSENT_TEXT = "I have this person's permission to use their face"
+
+# Stack page indices
+_PAGE_LIVE, _PAGE_PROFILES, _PAGE_PREVIEW, _PAGE_SETTINGS = range(4)
 
 # ---------------------------------------------------------------------------
 # Module-level lazy imports — referenced as globals by AST-tested methods.
@@ -79,61 +85,118 @@ def _save_settings(s: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dark theme stylesheet
+# Theme: near-black surfaces, hairline borders, one indigo accent, 13px type
 # ---------------------------------------------------------------------------
 
+_ACCENT = "#5e6ad2"
+
 _STYLE = """
-QMainWindow, QWidget { background: #1a1a1a; color: #f0f0f0; }
+* {
+    font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: 13px;
+    color: #e6e7ea;
+}
+QMainWindow { background: #101113; }
+QFrame#sidebar { background: #08090a; border: none; border-right: 1px solid #1f2023; }
+QFrame#header { background: #101113; border: none; border-bottom: 1px solid #1f2023; }
+QFrame#card { background: #131416; border: 1px solid #23252a; border-radius: 8px; }
+QFrame#divider { background: #1f2023; border: none; max-height: 1px; min-height: 1px; }
+QStackedWidget, QScrollArea, QWidget#page { background: #101113; border: none; }
+
+QLabel { background: transparent; }
+QLabel#brand { font-size: 14px; font-weight: 600; color: #f7f8f8; }
+QLabel#page_title { font-size: 15px; font-weight: 600; color: #f7f8f8; }
+QLabel#muted, QLabel#page_subtitle { color: #8a8f98; font-size: 12px; }
+QLabel#section { color: #8a8f98; font-size: 12px; font-weight: 600; }
+QLabel#row_title { color: #f7f8f8; }
+QLabel#pill {
+    background: #1b1c1f; border: 1px solid #2a2c31; border-radius: 9px;
+    padding: 1px 8px; color: #b4b8bf; font-size: 12px;
+}
+QLabel#video { background: #000000; border: 1px solid #23252a; border-radius: 8px; }
+QLabel#thumb { background: #1b1c1f; border: 1px solid #2a2c31; border-radius: 6px; }
+
 QPushButton {
-    background: #2d2d2d; color: #f0f0f0; border: 1px solid #444;
-    border-radius: 8px; padding: 8px 16px; font-size: 14px;
+    background: #1b1c1f; border: 1px solid #2a2c31; border-radius: 6px;
+    padding: 5px 12px; min-height: 18px;
 }
-QPushButton:hover { background: #3a3a3a; }
-QPushButton:pressed { background: #252525; }
-QPushButton#start_btn {
-    background: #2e7d32; color: #fff; font-size: 18px; font-weight: bold;
-    border: none; border-radius: 12px; padding: 16px 40px;
+QPushButton:hover { background: #232428; border-color: #34363c; }
+QPushButton:pressed { background: #17181a; }
+QPushButton:disabled { color: #62666d; background: #141517; border-color: #1f2023; }
+QPushButton#primary {
+    background: #5e6ad2; border: 1px solid #6c78e6; color: #ffffff; font-weight: 600;
 }
-QPushButton#start_btn:hover { background: #388e3c; }
-QPushButton#stop_btn {
-    background: #c62828; color: #fff; font-size: 14px;
-    border: none; border-radius: 8px; padding: 8px 20px;
+QPushButton#primary:hover { background: #6c78e6; }
+QPushButton#primary:disabled { background: #25273d; border-color: #25273d; color: #7b7f9c; }
+QPushButton#danger { background: transparent; border: 1px solid #5c2b2e; color: #eb5757; }
+QPushButton#danger:hover { background: #2a1517; }
+QPushButton#nav {
+    background: transparent; border: none; border-radius: 6px;
+    padding: 6px 10px; text-align: left; color: #8a8f98;
 }
-QPushButton#card_btn {
-    background: #232323; border: 2px solid #333; border-radius: 16px;
-    padding: 32px 24px; font-size: 16px; text-align: center;
+QPushButton#nav:hover { background: #151618; color: #e6e7ea; }
+QPushButton#nav:checked { background: #1b1c1f; color: #f7f8f8; }
+QPushButton#row {
+    background: transparent; border: none; border-radius: 6px;
+    padding: 8px 10px; text-align: left;
 }
-QPushButton#card_btn:hover { background: #2a2a2a; border-color: #4CAF50; }
-QComboBox {
-    background: #2d2d2d; color: #f0f0f0; border: 1px solid #444;
-    border-radius: 6px; padding: 6px 12px; font-size: 13px;
+QPushButton#row:hover { background: #1b1c1f; }
+QPushButton#row:checked { background: #1e2030; color: #f7f8f8; }
+QPushButton#segment { border-radius: 0; padding: 4px 14px; color: #8a8f98; }
+QPushButton#segment:checked { background: #2a2c31; color: #f7f8f8; }
+
+QComboBox, QLineEdit {
+    background: #1b1c1f; border: 1px solid #2a2c31; border-radius: 6px;
+    padding: 5px 10px; min-height: 18px; selection-background-color: #5e6ad2;
 }
-QComboBox QAbstractItemView { background: #2d2d2d; color: #f0f0f0; }
-QLineEdit {
-    background: #2d2d2d; color: #f0f0f0; border: 1px solid #444;
-    border-radius: 6px; padding: 8px 12px; font-size: 14px;
+QComboBox:hover, QLineEdit:hover { border-color: #34363c; }
+QComboBox:focus, QLineEdit:focus { border-color: #5e6ad2; }
+QComboBox QAbstractItemView {
+    background: #1b1c1f; border: 1px solid #2a2c31; outline: none;
+    selection-background-color: #2a2c31;
 }
+
+QCheckBox { spacing: 8px; background: transparent; }
+QCheckBox::indicator {
+    width: 14px; height: 14px; border-radius: 4px;
+    border: 1px solid #3a3d44; background: #1b1c1f;
+}
+QCheckBox::indicator:hover { border-color: #5e6ad2; }
+QCheckBox::indicator:checked { background: #5e6ad2; border-color: #6c78e6; }
+
 QProgressBar {
-    background: #2d2d2d; border: 1px solid #444; border-radius: 6px;
-    text-align: center; color: #f0f0f0;
+    background: #1b1c1f; border: none; border-radius: 2px;
+    max-height: 4px; min-height: 4px;
 }
-QProgressBar::chunk { background: #4CAF50; border-radius: 5px; }
-QLabel#section_title { font-size: 15px; font-weight: bold; color: #aaa; }
-QLabel#big_title { font-size: 32px; font-weight: bold; color: #fff; }
-QLabel#subtitle { font-size: 15px; color: #888; }
-QCheckBox { font-size: 13px; }
-QCheckBox::indicator { width: 20px; height: 20px; border-radius: 4px;
-                        border: 1px solid #555; background: #2d2d2d; }
-QCheckBox::indicator:checked { background: #4CAF50; border-color: #4CAF50; }
-QScrollArea { border: none; }
-QFrame#drop_zone {
-    border: 2px dashed #555; border-radius: 12px; background: #232323;
+QProgressBar::chunk { background: #5e6ad2; border-radius: 2px; }
+
+QFrame#drop_zone { border: 1px dashed #34363c; border-radius: 8px; background: #121315; }
+QFrame#drop_zone:hover { border-color: #5e6ad2; background: #14151a; }
+
+QStatusBar {
+    background: #08090a; border-top: 1px solid #1f2023; color: #8a8f98; font-size: 12px;
 }
-QFrame#drop_zone:hover { border-color: #4CAF50; }
-QFrame#profile_card {
-    background: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 10px;
-}
+QStatusBar QLabel { color: #8a8f98; font-size: 12px; }
+QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
+QScrollBar::handle:vertical { background: #2a2c31; border-radius: 4px; min-height: 24px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
+
+
+def _label(text: str, name: str = "", wrap: bool = False) -> QLabel:
+    label = QLabel(text)
+    if name:
+        label.setObjectName(name)
+    label.setWordWrap(wrap)
+    return label
+
+
+def _pixmap_from_bgr(bgr: np.ndarray) -> QPixmap:
+    rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    h, w = rgb.shape[:2]
+    # QPixmap.fromImage copies the pixels, so the numpy buffer may go away.
+    return QPixmap.fromImage(QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888))
+
 
 # ---------------------------------------------------------------------------
 # Worker signals
@@ -167,8 +230,84 @@ class _ModeIndex:
 
 
 # ---------------------------------------------------------------------------
-# Drop zone widget
+# Small building blocks
 # ---------------------------------------------------------------------------
+
+class _Toggle(QCheckBox):
+    """A switch: QCheckBox behaviour, painted as a pill with a sliding knob."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(30, 18)
+
+    def sizeHint(self) -> QSize:
+        return QSize(30, 18)
+
+    def hitButton(self, pos) -> bool:
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(_ACCENT if self.isChecked() else "#2a2c31"))
+        painter.drawRoundedRect(0, 0, 30, 18, 9, 9)
+        painter.setBrush(QColor("#ffffff" if self.isChecked() else "#8a8f98"))
+        painter.drawEllipse(14 if self.isChecked() else 2, 2, 14, 14)
+        painter.end()
+
+
+class _PageHeader(QFrame):
+    """Title and subtitle on the left, the page's actions on the right."""
+
+    def __init__(self, title: str, subtitle: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("header")
+        self.setFixedHeight(56)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(24, 0, 24, 0)
+        row.setSpacing(8)
+        titles = QVBoxLayout()
+        titles.setSpacing(1)
+        titles.setAlignment(Qt.AlignVCenter)
+        titles.addWidget(_label(title, "page_title"))
+        if subtitle:
+            titles.addWidget(_label(subtitle, "page_subtitle"))
+        row.addLayout(titles)
+        row.addStretch()
+        self.actions = QHBoxLayout()
+        self.actions.setSpacing(8)
+        row.addLayout(self.actions)
+
+
+def _page(header: _PageHeader) -> tuple[QWidget, QVBoxLayout]:
+    """A page: header, then a scrollable content column. Returns (page, column)."""
+    page = QWidget()
+    page.setObjectName("page")
+    outer = QVBoxLayout(page)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+    outer.addWidget(header)
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    body = QWidget()
+    body.setObjectName("page")
+    column = QVBoxLayout(body)
+    column.setContentsMargins(24, 20, 24, 24)
+    column.setSpacing(10)
+    column.setAlignment(Qt.AlignTop)
+    body.setMaximumWidth(720)
+    scroll.setWidget(body)
+    outer.addWidget(scroll)
+    return page, column
+
+
+def _divider() -> QFrame:
+    line = QFrame()
+    line.setObjectName("divider")
+    return line
+
 
 class _DropZone(QFrame):
     files_dropped = Signal(list)
@@ -178,17 +317,11 @@ class _DropZone(QFrame):
         self.setObjectName("drop_zone")
         self._multiple = multiple
         self.setAcceptDrops(True)
-        self.setMinimumHeight(140)
+        self.setMinimumHeight(96)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
-        self._icon = QLabel("📁", self)
-        self._icon.setAlignment(Qt.AlignCenter)
-        self._icon.setStyleSheet("font-size: 40px; border: none;")
-        self._label = QLabel(text, self)
+        self._label = _label(text, "muted", wrap=True)
         self._label.setAlignment(Qt.AlignCenter)
-        self._label.setWordWrap(True)
-        self._label.setStyleSheet("font-size: 14px; color: #aaa; border: none;")
-        layout.addWidget(self._icon)
         layout.addWidget(self._label)
         self.setCursor(Qt.PointingHandCursor)
 
@@ -220,10 +353,6 @@ class _DropZone(QFrame):
             self.files_dropped.emit(paths)
 
 
-# ---------------------------------------------------------------------------
-# Photo thumbnail strip
-# ---------------------------------------------------------------------------
-
 class _PhotoStrip(QWidget):
     def __init__(self, max_photos: int = 10, parent=None):
         super().__init__(parent)
@@ -233,11 +362,10 @@ class _PhotoStrip(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
         self._cells: list[QLabel] = []
-        for i in range(max_photos):
-            cell = QLabel()
-            cell.setFixedSize(60, 60)
+        for _ in range(max_photos):
+            cell = _label("", "thumb")
+            cell.setFixedSize(48, 48)
             cell.setAlignment(Qt.AlignCenter)
-            cell.setStyleSheet("background:#232323; border-radius:6px; border:1px solid #333;")
             layout.addWidget(cell)
             self._cells.append(cell)
         layout.addStretch()
@@ -245,184 +373,65 @@ class _PhotoStrip(QWidget):
     def set_paths(self, paths: list[str]) -> None:
         self._paths = paths[:self._max]
         for i, cell in enumerate(self._cells):
+            cell.setPixmap(QPixmap())
+            cell.setText("")
             if i < len(self._paths):
                 img = cv2.imread(self._paths[i])
                 if img is not None:
-                    img = cv2.resize(img, (58, 58))
-                    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    qimg = QImage(rgb.data, 58, 58, 58 * 3, QImage.Format_RGB888)
-                    cell.setPixmap(QPixmap.fromImage(qimg))
+                    cell.setPixmap(_pixmap_from_bgr(cv2.resize(img, (46, 46))))
                 else:
                     cell.setText("?")
-            else:
-                cell.setPixmap(QPixmap())
-                cell.setText("")
 
 
 # ---------------------------------------------------------------------------
-# Settings dialog
-# ---------------------------------------------------------------------------
-
-class _SettingsDialog(QDialog):
-    def __init__(self, settings: dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.setMinimumWidth(380)
-        self._s = dict(settings)
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-
-        # Virtual camera
-        self._vcam_cb = QCheckBox("Virtual camera (DirectShow Softcam)")
-        self._vcam_cb.setChecked(self._s.get("vcam_enabled", True))
-        layout.addWidget(self._vcam_cb)
-
-        # Quality
-        qlayout = QHBoxLayout()
-        qlayout.addWidget(QLabel("Quality:"))
-        self._quality_fast = QPushButton("Fast")
-        self._quality_fast.setCheckable(True)
-        self._quality_ultra = QPushButton("Ultra")
-        self._quality_ultra.setCheckable(True)
-        q = self._s.get("quality", "ultra")
-        self._quality_fast.setChecked(q == "fast")
-        self._quality_ultra.setChecked(q == "ultra")
-        self._quality_fast.clicked.connect(lambda: self._set_quality("fast"))
-        self._quality_ultra.clicked.connect(lambda: self._set_quality("ultra"))
-        qlayout.addWidget(self._quality_fast)
-        qlayout.addWidget(self._quality_ultra)
-        qlayout.addStretch()
-        layout.addLayout(qlayout)
-
-        # Advanced section
-        adv_btn = QPushButton("▼ Advanced")
-        adv_btn.setFlat(True)
-        adv_btn.setStyleSheet("color: #888; font-size: 12px; text-align: left; padding: 4px;")
-        layout.addWidget(adv_btn)
-        self._adv_box = QGroupBox()
-        self._adv_box.hide()
-        adv_inner = QVBoxLayout(self._adv_box)
-        self._pixel_boost_cb = QCheckBox("Pixel boost (4 swap passes at 512px, slower)")
-        self._pixel_boost_cb.setChecked(self._s.get("pixel_boost", False))
-        self._pct_cb = QCheckBox("PCT color harmonization (better lighting match)")
-        self._pct_cb.setChecked(self._s.get("pct_harmonize", False))
-        self._occ_cb = QCheckBox("Occlusion detection (hands/objects)")
-        self._occ_cb.setChecked(self._s.get("occlusion", False))
-        self._webrtc_cb = QCheckBox("Stream to phone (WebRTC, port 8765)")
-        self._webrtc_cb.setChecked(self._s.get("webrtc_enabled", False))
-        for w in (self._pixel_boost_cb, self._pct_cb, self._occ_cb, self._webrtc_cb):
-            adv_inner.addWidget(w)
-        layout.addWidget(self._adv_box)
-        adv_btn.clicked.connect(lambda: (
-            self._adv_box.show() if self._adv_box.isHidden() else self._adv_box.hide()))
-
-        btns = QHBoxLayout()
-        ok_btn = QPushButton("OK")
-        ok_btn.setDefault(True)
-        ok_btn.clicked.connect(self.accept)
-        btns.addStretch()
-        btns.addWidget(ok_btn)
-        layout.addLayout(btns)
-
-    def _set_quality(self, q: str) -> None:
-        self._quality_fast.setChecked(q == "fast")
-        self._quality_ultra.setChecked(q == "ultra")
-
-    def result_settings(self) -> dict:
-        q = "fast" if self._quality_fast.isChecked() else "ultra"
-        return dict(self._s,
-                    vcam_enabled=self._vcam_cb.isChecked(),
-                    quality=q,
-                    pixel_boost=self._pixel_boost_cb.isChecked(),
-                    pct_harmonize=self._pct_cb.isChecked(),
-                    occlusion=self._occ_cb.isChecked(),
-                    webrtc_enabled=self._webrtc_cb.isChecked())
-
-
-# ---------------------------------------------------------------------------
-# Welcome page
-# ---------------------------------------------------------------------------
-
-class _WelcomePage(QWidget):
-    quick_start = Signal()
-    high_quality = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        outer = QVBoxLayout(self)
-        outer.setAlignment(Qt.AlignCenter)
-        outer.setSpacing(24)
-
-        title = QLabel("liveswap")
-        title.setObjectName("big_title")
-        title.setAlignment(Qt.AlignCenter)
-        outer.addWidget(title)
-
-        sub = QLabel("Real-time face swap")
-        sub.setObjectName("subtitle")
-        sub.setAlignment(Qt.AlignCenter)
-        outer.addWidget(sub)
-
-        cards = QHBoxLayout()
-        cards.setSpacing(24)
-
-        quick = QPushButton("⚡ Quick Start\n\n1 photo, instant\n\nDrop a photo, pick your camera\nand go live immediately")
-        quick.setObjectName("card_btn")
-        quick.setMinimumSize(240, 200)
-        quick.setWordWrap(True)
-        quick.clicked.connect(self.quick_start)
-        cards.addWidget(quick)
-
-        hq = QPushButton("⭐ High Quality\n\nMultiple photos, 2 min setup\n\nBetter identity preservation\nwith a named profile")
-        hq.setObjectName("card_btn")
-        hq.setMinimumSize(240, 200)
-        hq.setWordWrap(True)
-        hq.clicked.connect(self.high_quality)
-        cards.addWidget(hq)
-
-        outer.addLayout(cards)
-        outer.addStretch()
-
-
-# ---------------------------------------------------------------------------
-# Live mode page
+# Live page: one photo, pick a camera, start
 # ---------------------------------------------------------------------------
 
 class _LivePage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setSpacing(16)
-        layout.setContentsMargins(32, 24, 32, 24)
+        header = _PageHeader("Live", "One source photo, start immediately")
+        self.start_btn = QPushButton("Start")
+        self.start_btn.setObjectName("primary")
+        self.start_btn.setEnabled(False)
+        header.actions.addWidget(self.start_btn)
 
-        self._drop = _DropZone("👤  Drop your photo here\nor click to browse", multiple=False)
-        self._drop.files_dropped.connect(self._on_photo)
-        layout.addWidget(self._drop)
+        page, column = _page(header)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(page)
 
-        self._photo_label = QLabel()
+        column.addWidget(_label("Source face", "section"))
+        source_row = QHBoxLayout()
+        source_row.setSpacing(12)
+        self._photo_label = _label("", "thumb")
+        self._photo_label.setFixedSize(96, 96)
         self._photo_label.setAlignment(Qt.AlignCenter)
         self._photo_label.hide()
-        layout.addWidget(self._photo_label)
+        source_row.addWidget(self._photo_label)
+        self._drop = _DropZone("Drop a photo here, or click to browse", multiple=False)
+        self._drop.files_dropped.connect(self._on_photo)
+        source_row.addWidget(self._drop, stretch=1)
+        column.addLayout(source_row)
 
-        cam_row = QHBoxLayout()
-        cam_row.addWidget(QLabel("Camera:"))
+        self.consent_cb = QCheckBox(_CONSENT_TEXT)
+        self.consent_cb.toggled.connect(self._update_start)
+        column.addWidget(self.consent_cb)
+
+        column.addSpacing(10)
+        column.addWidget(_label("Camera", "section"))
         self.cam_combo = QComboBox()
+        self.cam_combo.setMaximumWidth(280)
         self._populate_cameras()
-        cam_row.addWidget(self.cam_combo)
-        cam_row.addStretch()
-        layout.addLayout(cam_row)
+        column.addWidget(self.cam_combo)
 
-        self.start_btn = QPushButton("▶  Start")
-        self.start_btn.setObjectName("start_btn")
-        self.start_btn.setEnabled(False)
-        layout.addWidget(self.start_btn, alignment=Qt.AlignCenter)
+        column.addSpacing(10)
+        column.addWidget(_divider())
+        column.addWidget(_label(
+            "After starting, choose \"DirectShow Softcam\" as the camera in your video app. "
+            "Every swapped frame carries a visible \"AI-GENERATED FACE\" label.",
+            "muted", wrap=True))
 
-        self._hint = QLabel("💡 After starting: open your video app → select 'DirectShow Softcam'")
-        self._hint.setAlignment(Qt.AlignCenter)
-        self._hint.setStyleSheet("font-size: 12px; color: #666;")
-        layout.addWidget(self._hint)
-
-        layout.addStretch()
         self._photo_path: str = ""
 
     def _populate_cameras(self) -> None:
@@ -435,20 +444,22 @@ class _LivePage(QWidget):
         if self.cam_combo.count() == 0:
             self.cam_combo.addItem("No camera found", userData=0)
 
+    def _update_start(self) -> None:
+        self.start_btn.setEnabled(bool(self._photo_path) and self.consent_cb.isChecked())
+
     def _on_photo(self, paths: list[str]) -> None:
         self._photo_path = paths[0]
-        self.start_btn.setEnabled(True)
-        # Show thumbnail
+        # Permission is given per person: a new photo needs it again.
+        self.consent_cb.setChecked(False)
         img = cv2.imread(self._photo_path)
         if img is not None:
             h, w = img.shape[:2]
-            scale = 100 / max(h, w, 1)
-            small = cv2.resize(img, (int(w * scale), int(h * scale)))
-            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-            qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.shape[1] * 3, QImage.Format_RGB888)
-            self._photo_label.setPixmap(QPixmap.fromImage(qimg).copy())
+            scale = 94 / max(h, w, 1)
+            small = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))))
+            self._photo_label.setPixmap(_pixmap_from_bgr(small))
             self._photo_label.show()
-            self._drop.set_text(f"✓ {Path(self._photo_path).name}")
+        self._drop.set_text(f"{Path(self._photo_path).name}\nDrop or click to replace")
+        self._update_start()
 
     @property
     def photo_path(self) -> str:
@@ -461,7 +472,7 @@ class _LivePage(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Profile mode page
+# Profiles page: pick a saved profile and start, or create a new one
 # ---------------------------------------------------------------------------
 
 class _ProfilePage(QWidget):
@@ -469,86 +480,99 @@ class _ProfilePage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setSpacing(16)
-        layout.setContentsMargins(32, 24, 32, 24)
+        header = _PageHeader("Profiles", "Several photos of one person, stronger identity")
+        self.start_btn = QPushButton("Start")
+        self.start_btn.setObjectName("primary")
+        self.start_btn.setEnabled(False)
+        header.actions.addWidget(self.start_btn)
 
-        # Saved profiles scroll area
-        self._profiles_label = QLabel("Saved profiles:")
-        self._profiles_label.setObjectName("section_title")
-        layout.addWidget(self._profiles_label)
+        page, column = _page(header)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(page)
 
-        self._profiles_scroll = QScrollArea()
-        self._profiles_scroll.setWidgetResizable(True)
-        self._profiles_container = QWidget()
-        self._profiles_layout = QHBoxLayout(self._profiles_container)
-        self._profiles_layout.setSpacing(12)
-        self._profiles_layout.addStretch()
-        self._profiles_scroll.setWidget(self._profiles_container)
-        self._profiles_scroll.setMaximumHeight(130)
-        layout.addWidget(self._profiles_scroll)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color: #333;")
-        layout.addWidget(sep)
-
-        # Create new profile area
-        layout.addWidget(QLabel("Create new profile:"))
-
-        self._drop = _DropZone(
-            "📸  Drop 5–10 photos of the person\nor click to browse",
-            multiple=True,
-        )
-        self._drop.files_dropped.connect(self._on_photos)
-        layout.addWidget(self._drop)
-
-        self._strip = _PhotoStrip(max_photos=10)
-        layout.addWidget(self._strip)
-
-        name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("Name:"))
-        self._name_edit = QLineEdit()
-        self._name_edit.setPlaceholderText("e.g. John")
-        name_row.addWidget(self._name_edit)
-        layout.addLayout(name_row)
-
-        self.create_btn = QPushButton("⭐  Create Profile")
-        self.create_btn.setObjectName("start_btn")
-        self.create_btn.setEnabled(False)
-        self.create_btn.clicked.connect(self._on_create)
-        layout.addWidget(self.create_btn, alignment=Qt.AlignCenter)
-
-        self._progress = QProgressBar()
-        self._progress.hide()
-        self._progress_label = QLabel()
-        self._progress_label.setAlignment(Qt.AlignCenter)
-        self._progress_label.hide()
-        layout.addWidget(self._progress)
-        layout.addWidget(self._progress_label)
-
-        layout.addStretch()
-
-        self._photo_paths: list[str] = []
-
-        # Hidden profile selector for internal _start_pipeline logic
+        # Hidden selector: _start_pipeline reads the chosen profile from it.
         self.profile_combo = QComboBox()
         self.profile_combo.hide()
-        layout.addWidget(self.profile_combo)
+        column.addWidget(self.profile_combo)
 
+        column.addWidget(_label("Saved profiles", "section"))
+        card = QFrame()
+        card.setObjectName("card")
+        self._profiles_layout = QVBoxLayout(card)
+        self._profiles_layout.setContentsMargins(6, 6, 6, 6)
+        self._profiles_layout.setSpacing(2)
+        self._profile_group = QButtonGroup(self)
+        self._profile_group.setExclusive(True)
+        column.addWidget(card)
+
+        self.consent_cb = QCheckBox(_CONSENT_TEXT)
+        self.consent_cb.toggled.connect(self._update_buttons)
+        column.addWidget(self.consent_cb)
+
+        column.addSpacing(10)
+        column.addWidget(_divider())
+        column.addSpacing(4)
+        column.addWidget(_label("New profile", "section"))
+
+        self._drop = _DropZone("Drop 5-10 photos of the person, or click to browse",
+                               multiple=True)
+        self._drop.files_dropped.connect(self._on_photos)
+        column.addWidget(self._drop)
+
+        self._strip = _PhotoStrip(max_photos=10)
+        column.addWidget(self._strip)
+
+        name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("Profile name")
+        self._name_edit.setMaximumWidth(280)
+        self._name_edit.textChanged.connect(self._update_buttons)
+        name_row.addWidget(self._name_edit)
+        self.create_btn = QPushButton("Create profile")
+        self.create_btn.setEnabled(False)
+        self.create_btn.clicked.connect(self._on_create)
+        name_row.addWidget(self.create_btn)
+        name_row.addStretch()
+        column.addLayout(name_row)
+
+        self._progress = QProgressBar()
+        self._progress.setTextVisible(False)
+        self._progress.hide()
+        self._progress_label = _label("", "muted", wrap=True)
+        self._progress_label.hide()
+        column.addWidget(self._progress)
+        column.addWidget(self._progress_label)
+
+        self._photo_paths: list[str] = []
+        self._creating = False
         self.refresh_profiles()
+
+    def _has_profile(self) -> bool:
+        return (self.profile_combo.count() > 0
+                and self.profile_combo.currentText() != "(no profiles)")
+
+    def _update_buttons(self) -> None:
+        consent = self.consent_cb.isChecked()
+        self.start_btn.setEnabled(consent and self._has_profile())
+        self.create_btn.setEnabled(
+            consent and not self._creating and bool(self._photo_paths)
+            and bool(self._name_edit.text().strip()))
 
     def _on_photos(self, paths: list[str]) -> None:
         self._photo_paths = paths[:10]
         self._strip.set_paths(self._photo_paths)
-        self._drop.set_text(f"✓ {len(self._photo_paths)} / 10 photos")
-        self.create_btn.setEnabled(bool(self._name_edit.text().strip()))
+        self._drop.set_text(f"{len(self._photo_paths)} of 10 photos selected\n"
+                            "Drop or click to replace")
+        self._update_buttons()
 
     def _on_create(self) -> None:
         name = self._name_edit.text().strip()
         if not name or not self._photo_paths:
             return
-        self.create_btn.setEnabled(False)
+        self._creating = True
+        self._update_buttons()
         self._progress.setRange(0, 0)  # indeterminate
         self._progress.show()
         self._progress_label.setText("Analyzing photos…")
@@ -558,25 +582,32 @@ class _ProfilePage(QWidget):
     def show_progress(self, msg: str) -> None:
         self._progress_label.setText(msg)
 
+    def show_failed(self) -> None:
+        """Creation failed: stop the spinner and let the user retry."""
+        self._creating = False
+        self._progress.hide()
+        self._progress_label.hide()
+        self._update_buttons()
+
     def show_done(self, name: str, quality: float) -> None:
+        self._creating = False
         self._progress.hide()
         self._progress_label.setText(
-            f"✓ Profile '{name}' created — identity strength: {int(quality * 100)}%")
+            f"Profile \"{name}\" created. Identity strength: {int(quality * 100)}%")
         self._name_edit.clear()
         self._photo_paths = []
         self._strip.set_paths([])
-        self._drop.set_text("📸  Drop 5–10 photos of the person\nor click to browse")
-        self.create_btn.setEnabled(False)
+        self._drop.set_text("Drop 5-10 photos of the person, or click to browse")
         self.refresh_profiles()
+        self._select_profile(name)
 
     def refresh_profiles(self) -> None:
         try:
             from faceswap.profile.manager import list_profiles
-            profiles = list_profiles()
+            profiles = list(list_profiles())
         except Exception:
             profiles = []
 
-        # Update hidden combo
         self.profile_combo.clear()
         if not profiles:
             self.profile_combo.addItem("(no profiles)")
@@ -584,35 +615,136 @@ class _ProfilePage(QWidget):
             for name in profiles:
                 self.profile_combo.addItem(name)
 
-        # Update profile cards
-        for i in reversed(range(self._profiles_layout.count() - 1)):
-            item = self._profiles_layout.itemAt(i)
-            if item and item.widget():
-                item.widget().deleteLater()
+        while self._profiles_layout.count():
+            item = self._profiles_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                self._profile_group.removeButton(widget)
+                widget.deleteLater()
 
         if not profiles:
-            lbl = QLabel("No profiles yet")
-            lbl.setStyleSheet("color: #666; font-size: 13px;")
-            self._profiles_layout.insertWidget(0, lbl)
+            empty = _label("No profiles yet. Create one below.", "muted")
+            empty.setContentsMargins(10, 8, 10, 8)
+            self._profiles_layout.addWidget(empty)
         else:
-            for name in profiles:
-                card = QPushButton(f"👤 {name}")
-                card.setObjectName("card_btn")
-                card.setFixedHeight(90)
-                card.setMinimumWidth(120)
-                # Select this profile when clicked
-                card.clicked.connect(lambda checked=False, n=name: self._select_profile(n))
-                self._profiles_layout.insertWidget(0, card)
+            for index, name in enumerate(profiles):
+                row = QPushButton(name)
+                row.setObjectName("row")
+                row.setCheckable(True)
+                row.setChecked(index == 0)
+                row.setCursor(Qt.PointingHandCursor)
+                row.clicked.connect(lambda checked=False, n=name: self._select_profile(n))
+                self._profile_group.addButton(row)
+                self._profiles_layout.addWidget(row)
+        self._update_buttons()
 
     def _select_profile(self, name: str) -> None:
         # Sync hidden combo so _start_pipeline picks up the right profile
         idx = self.profile_combo.findText(name)
         if idx >= 0:
             self.profile_combo.setCurrentIndex(idx)
+            for button in self._profile_group.buttons():
+                if button.text() == name:
+                    button.setChecked(True)
+        self._update_buttons()
 
 
 # ---------------------------------------------------------------------------
-# Preview overlay (shown when pipeline is running)
+# Settings page: rows of label + control, saved as soon as they change
+# ---------------------------------------------------------------------------
+
+class _SettingsPage(QWidget):
+    changed = Signal(dict)
+
+    _TOGGLES = [
+        # (settings key, title, description)
+        ("vcam_enabled", "Virtual camera",
+         "Send output to the DirectShow Softcam device."),
+        ("webrtc_enabled", "Stream to phone",
+         "Serve the output over WebRTC on port 8765."),
+        ("pixel_boost", "Pixel boost",
+         "Swap at 512 px in four passes. Sharper, about four times the swap cost."),
+        ("pct_harmonize", "Local color harmonization",
+         "Match lighting that differs across the face."),
+        ("occlusion", "Occlusion detection",
+         "Keep hands and objects in front of the face."),
+        ("tensorrt", "TensorRT for restoration",
+         "Experimental and untested. Needs TensorRT installed; the first start "
+         "builds an engine and takes several minutes."),
+    ]
+
+    def __init__(self, settings: dict, parent=None):
+        super().__init__(parent)
+        self._s = dict(settings)
+        header = _PageHeader("Settings", "Changes apply the next time you start")
+        page, column = _page(header)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(page)
+
+        card = QFrame()
+        card.setObjectName("card")
+        rows = QVBoxLayout(card)
+        rows.setContentsMargins(16, 6, 16, 6)
+        rows.setSpacing(0)
+
+        # Quality: a two-way segmented control
+        segment = QHBoxLayout()
+        segment.setSpacing(0)
+        self._quality_fast = QPushButton("Fast")
+        self._quality_ultra = QPushButton("Ultra")
+        group = QButtonGroup(self)
+        group.setExclusive(True)
+        for button in (self._quality_fast, self._quality_ultra):
+            button.setObjectName("segment")
+            button.setCheckable(True)
+            group.addButton(button)
+            segment.addWidget(button)
+        ultra = self._s.get("quality", "ultra") == "ultra"
+        self._quality_ultra.setChecked(ultra)
+        self._quality_fast.setChecked(not ultra)
+        group.buttonClicked.connect(lambda _button: self._emit())
+        control = QWidget()
+        control.setLayout(segment)
+        rows.addLayout(self._row(
+            "Quality", "Ultra adds skin detail, scattering and highlight transfer.", control))
+
+        self._toggles: dict[str, _Toggle] = {}
+        for key, title, description in self._TOGGLES:
+            rows.addWidget(_divider())
+            toggle = _Toggle()
+            toggle.setChecked(bool(self._s.get(key, _DEFAULT_SETTINGS[key])))
+            toggle.toggled.connect(lambda _checked: self._emit())
+            self._toggles[key] = toggle
+            rows.addLayout(self._row(title, description, toggle))
+        column.addWidget(card)
+
+    @staticmethod
+    def _row(title: str, description: str, control: QWidget) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 10, 0, 10)
+        row.setSpacing(16)
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        text.addWidget(_label(title, "row_title"))
+        text.addWidget(_label(description, "muted", wrap=True))
+        row.addLayout(text, stretch=1)
+        row.addWidget(control, alignment=Qt.AlignVCenter)
+        return row
+
+    def result_settings(self) -> dict:
+        result = dict(self._s, quality="ultra" if self._quality_ultra.isChecked() else "fast")
+        for key, toggle in self._toggles.items():
+            result[key] = toggle.isChecked()
+        return result
+
+    def _emit(self) -> None:
+        self._s = self.result_settings()
+        self.changed.emit(dict(self._s))
+
+
+# ---------------------------------------------------------------------------
+# Preview page (shown while the pipeline is running)
 # ---------------------------------------------------------------------------
 
 class _PreviewOverlay(QWidget):
@@ -620,32 +752,40 @@ class _PreviewOverlay(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        self._video = QLabel()
-        self._video.setAlignment(Qt.AlignCenter)
-        self._video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self._video, stretch=1)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        self._stats = QLabel()
-        self._stats.setAlignment(Qt.AlignCenter)
-        self._stats.setStyleSheet("font-size: 11px; color: #888;")
-        layout.addWidget(self._stats)
-
-        stop_btn = QPushButton("■  Stop")
-        stop_btn.setObjectName("stop_btn")
+        header = _PageHeader("Live output")
+        self._stats = _label("Starting", "pill")
+        header.actions.addWidget(self._stats, alignment=Qt.AlignVCenter)
+        stop_btn = QPushButton("Stop")
+        stop_btn.setObjectName("danger")
         stop_btn.clicked.connect(self.stop_requested)
-        layout.addWidget(stop_btn, alignment=Qt.AlignCenter)
+        header.actions.addWidget(stop_btn)
+        outer.addWidget(header)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(24, 20, 24, 16)
+        body.setSpacing(10)
+        self._video = _label("", "video")
+        self._video.setAlignment(Qt.AlignCenter)
+        self._video.setMinimumSize(320, 180)
+        self._video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        body.addWidget(self._video, stretch=1)
+        self._stages = _label("", "muted", wrap=True)
+        body.addWidget(self._stages)
+        outer.addLayout(body, stretch=1)
 
     def show_frame(self, bgr: np.ndarray) -> None:
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
-        self._video.setPixmap(
-            QPixmap.fromImage(qimg).scaled(
-                self._video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._video.setPixmap(_pixmap_from_bgr(bgr).scaled(
+            self._video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def set_stats(self, text: str) -> None:
         self._stats.setText(text)
+
+    def set_stages(self, text: str) -> None:
+        self._stages.setText(text)
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +796,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("liveswap")
-        self.setMinimumSize(900, 640)
+        self.setMinimumSize(960, 640)
         self.setStyleSheet(_STYLE)
 
         self._settings = _load_settings()
@@ -681,54 +821,54 @@ class MainWindow(QMainWindow):
         self._starting = False
         self._closing  = False
         self._running  = False
+        self._shown_errors = 0
 
         # --- Mode tracker (satisfies _tabs.currentIndex() contract) ---
         self._tabs = _ModeIndex()
 
-        # --- Build UI ---
+        # --- Build UI: sidebar | pages ---
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Top navigation bar (hidden on welcome)
-        self._nav = QWidget()
-        nav_layout = QHBoxLayout(self._nav)
-        nav_layout.setContentsMargins(12, 8, 12, 8)
-        self._back_btn = QPushButton("← Back")
-        self._back_btn.clicked.connect(self._go_welcome)
-        nav_layout.addWidget(self._back_btn)
-        self._nav_title = QLabel()
-        self._nav_title.setStyleSheet("font-size: 16px; font-weight: bold;")
-        nav_layout.addWidget(self._nav_title)
-        nav_layout.addStretch()
-        gear_btn = QToolButton()
-        gear_btn.setText("⚙")
-        gear_btn.setStyleSheet("font-size: 18px; background: transparent; border: none;")
-        gear_btn.clicked.connect(self._open_settings)
-        nav_layout.addWidget(gear_btn)
-        self._nav.hide()
-        main_layout.addWidget(self._nav)
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(208)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(10, 14, 10, 10)
+        side.setSpacing(2)
+        brand = _label("liveswap", "brand")
+        brand.setContentsMargins(10, 0, 0, 10)
+        side.addWidget(brand)
+        self._nav_group = QButtonGroup(self)
+        self._nav_group.setExclusive(True)
+        self._nav_live = self._nav_button("Live", self._go_live)
+        self._nav_profiles = self._nav_button("Profiles", self._go_profile)
+        side.addWidget(self._nav_live)
+        side.addWidget(self._nav_profiles)
+        side.addStretch()
+        self._nav_settings = self._nav_button("Settings", self._open_settings)
+        side.addWidget(self._nav_settings)
+        main_layout.addWidget(sidebar)
 
-        # Stacked pages: 0=welcome, 1=live, 2=profile, 3=preview
         self._stack = QStackedWidget()
-        self._welcome_page = _WelcomePage()
-        self._welcome_page.quick_start.connect(self._go_live)
-        self._welcome_page.high_quality.connect(self._go_profile)
         self._live_page = _LivePage()
         self._profile_page = _ProfilePage()
         self._preview_overlay = _PreviewOverlay()
         self._preview_overlay.stop_requested.connect(self._stop_pipeline)
-        self._stack.addWidget(self._welcome_page)   # 0
-        self._stack.addWidget(self._live_page)       # 1
-        self._stack.addWidget(self._profile_page)    # 2
-        self._stack.addWidget(self._preview_overlay) # 3
-        main_layout.addWidget(self._stack)
+        self._settings_page = _SettingsPage(self._settings)
+        self._settings_page.changed.connect(self._on_settings_changed)
+        self._stack.addWidget(self._live_page)         # _PAGE_LIVE
+        self._stack.addWidget(self._profile_page)      # _PAGE_PROFILES
+        self._stack.addWidget(self._preview_overlay)   # _PAGE_PREVIEW
+        self._stack.addWidget(self._settings_page)     # _PAGE_SETTINGS
+        main_layout.addWidget(self._stack, stretch=1)
 
         # Wire up start buttons
-        self._live_page.start_btn.clicked.connect(self._start_pipeline)
-        self._profile_page.create_btn.clicked.connect(lambda: None)  # wired inside _ProfilePage
+        self._live_page.start_btn.clicked.connect(self._on_start_clicked)
+        self._profile_page.start_btn.clicked.connect(self._on_start_clicked)
         self._profile_page.create_requested.connect(self._create_profile)
 
         # Internal aliases required by tests
@@ -740,38 +880,56 @@ class MainWindow(QMainWindow):
 
         # Status bar
         self.setStatusBar(QStatusBar())
+        self.statusBar().setSizeGripEnabled(False)
 
         # Frame display timer
         self._frame_timer = QTimer(self)
         self._frame_timer.setInterval(33)
         self._frame_timer.timeout.connect(self._update_preview)
 
+        self._nav_live.setChecked(True)
+        self._go_live()
+
+    def _nav_button(self, text: str, handler) -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName("nav")
+        button.setCheckable(True)
+        button.setCursor(Qt.PointingHandCursor)
+        button.clicked.connect(lambda _checked=False: handler())
+        self._nav_group.addButton(button)
+        return button
+
     # --- Navigation ---
 
-    def _go_welcome(self) -> None:
-        self._stack.setCurrentIndex(0)
-        self._nav.hide()
-
     def _go_live(self) -> None:
-        self._tabs.setCurrentIndex(_ModeIndex.LIVE)
-        self._nav_title.setText("Live Mode")
-        self._stack.setCurrentIndex(1)
-        self._nav.show()
+        if not self._running:
+            self._tabs.setCurrentIndex(_ModeIndex.LIVE)
+        # While running, both mode pages are replaced by the live output.
+        self._stack.setCurrentIndex(_PAGE_PREVIEW if self._running else _PAGE_LIVE)
 
     def _go_profile(self) -> None:
-        self._tabs.setCurrentIndex(_ModeIndex.PROFILE)
-        self._nav_title.setText("Profile Mode")
-        self._stack.setCurrentIndex(2)
-        self._nav.show()
+        if not self._running:
+            self._tabs.setCurrentIndex(_ModeIndex.PROFILE)
+        self._stack.setCurrentIndex(_PAGE_PREVIEW if self._running else _PAGE_PROFILES)
 
     def _open_settings(self) -> None:
-        dlg = _SettingsDialog(self._settings, self)
-        if dlg.exec():
-            self._settings = dlg.result_settings()
-            _save_settings(self._settings)
-            self._quality_ultra.setChecked(self._settings.get("quality") == "ultra")
+        self._stack.setCurrentIndex(_PAGE_SETTINGS)
+
+    def _on_settings_changed(self, settings: dict) -> None:
+        self._settings = settings
+        _save_settings(self._settings)
+        self._quality_ultra.setChecked(self._settings.get("quality") == "ultra")
 
     # --- Pipeline start / stop ---
+
+    def _on_start_clicked(self) -> None:
+        """Start only with the user's confirmation that the source face may be used."""
+        profile_mode = self._tabs.currentIndex() == _ModeIndex.PROFILE
+        page = self._profile_page if profile_mode else self._live_page
+        if not page.consent_cb.isChecked():
+            self.statusBar().showMessage("Confirm you have permission to use this face")
+            return
+        self._start_pipeline()
 
     def _load_models(self) -> None:
         from faceswap.core.swapper  import FaceSwapper
@@ -779,7 +937,8 @@ class MainWindow(QMainWindow):
         from faceswap.core.parser   import FaceParser
 
         self._swapper  = FaceSwapper("models/alphaface_256.onnx",  model_type="alphaface")
-        self._enhancer = FaceEnhancer("models/GPEN-BFR-512.onnx")
+        self._enhancer = FaceEnhancer("models/GPEN-BFR-512.onnx",
+                                      tensorrt=self._settings.get("tensorrt", False))
         self._parser   = FaceParser("models/bisenet.onnx")
 
     def _start_pipeline(self) -> None:
@@ -859,12 +1018,13 @@ class MainWindow(QMainWindow):
         self._cap = cap
         self._running = True
         self._starting = False
+        self._shown_errors = 0
+        self.statusBar().showMessage("Running")
 
         # Virtual camera
         if self._settings.get("vcam_enabled", True):
             try:
                 from faceswap.camera.virtual_cam import VirtualCamera
-                from pathlib import Path
                 dll = str(Path("models/softcam.dll"))
                 self._vcam = VirtualCamera(1280, 720, 30.0, dll_path=dll)
             except Exception as e:
@@ -887,7 +1047,7 @@ class MainWindow(QMainWindow):
             self._pipeline, self._deliver_frame)
         self._runner.start(self._cap)
         self._frame_timer.start()
-        self._stack.setCurrentIndex(3)  # show preview
+        self._stack.setCurrentIndex(_PAGE_PREVIEW)
 
     def _deliver_frame(self, frame: np.ndarray) -> None:
         self._latest_frame = frame
@@ -905,11 +1065,23 @@ class MainWindow(QMainWindow):
             if self._pipeline:
                 ms = self._pipeline.last_inference_ms
                 fps = 1000 / ms if ms > 0 else 0
-                self._preview_overlay.set_stats(f"{fps:.0f} fps  |  {ms:.0f} ms")
+                self._preview_overlay.set_stats(f"{fps:.0f} fps  ·  {ms:.0f} ms")
+                slowest = sorted(self._pipeline.stage_ms.items(),
+                                 key=lambda item: item[1], reverse=True)[:6]
+                self._preview_overlay.set_stages(
+                    "   ".join(f"{name} {stage_ms:.0f} ms" for name, stage_ms in slowest))
+        # Frames that fail in the pipeline are passed through unprocessed; say so.
+        runner = self._runner
+        if runner is not None and runner.error_count != self._shown_errors:
+            self._shown_errors = runner.error_count
+            self.statusBar().showMessage(
+                f"{runner.error_count} frame(s) failed and were shown unprocessed: "
+                f"{runner.last_error}")
 
     @Slot(str, str)
     def _on_error(self, title: str, msg: str) -> None:
         self._starting = False
+        self._profile_page.show_failed()
         self.statusBar().showMessage(f"{title}: {msg}")
 
     @Slot(object, str, float)
@@ -950,7 +1122,7 @@ class MainWindow(QMainWindow):
         stk = getattr(self, '_stack', None)
         tabs = getattr(self, '_tabs', None)
         if stk is not None and tabs is not None:
-            stk.setCurrentIndex(2 if tabs.currentIndex() == 1 else 1)
+            stk.setCurrentIndex(1 if tabs.currentIndex() == 1 else 0)
         self.statusBar().showMessage("Stopped")
         return True
 
@@ -968,8 +1140,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._signals.failed.emit("Profile creation failed", str(exc))
 
-        import threading as _threading
-        _threading.Thread(target=_worker, daemon=True).start()
+        threading.Thread(target=_worker, daemon=True).start()
 
     # --- Lifecycle ---
 

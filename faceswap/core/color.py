@@ -17,28 +17,6 @@ Apply color correction again after GPEN (GPEN shifts colors — re-run once).
 from __future__ import annotations
 import cv2
 import numpy as np
-from scipy.ndimage import gaussian_filter
-
-# Cached pore texture tile — generated once at import, reused every frame
-_PORE_TILE: np.ndarray | None = None
-
-
-def _get_pore_tile(size: int = 256) -> np.ndarray:
-    global _PORE_TILE
-    if _PORE_TILE is None:
-        rng = np.random.default_rng(42)
-        noise = rng.standard_normal((size, size)).astype(np.float32)
-        pore_layer = np.zeros((size, size), dtype=np.float32)
-        for theta_deg in [0, 45, 90, 135]:
-            kernel = cv2.getGaborKernel(
-                (15, 15), sigma=2.0, theta=np.deg2rad(theta_deg),
-                lambd=8.0, gamma=0.8, psi=0
-            )
-            pore_layer += np.abs(cv2.filter2D(noise, cv2.CV_32F, kernel))
-        pore_layer = (pore_layer - pore_layer.mean()) / (pore_layer.std() + 1e-6)
-        _PORE_TILE = pore_layer
-    return _PORE_TILE
-
 
 # Sum-of-Gaussians skin diffusion profile (d'Eon & Luebke, GPU Gems 3):
 # (variance in mm², (R, G, B) weights). Each channel's weights sum to 1.
@@ -58,10 +36,24 @@ _SSS_CROP_WIDTH_MM = 256.0
 _TO_LINEAR = ((np.arange(256, dtype=np.float32) / 255.0) ** 2.2).astype(np.float32)
 
 
+# BT.709 luminance weights for a BGR image, as a cv2.transform matrix.
+_BT709_BGR = np.array([[0.0722, 0.7152, 0.2126]], dtype=np.float32)
+
+
 def _to_gamma_u8(linear: np.ndarray) -> np.ndarray:
     """Linear float32 [0, 1] -> gamma-encoded uint8."""
     encoded = cv2.pow(np.clip(linear, 0.0, 1.0), 1.0 / 2.2)
     return np.clip(encoded * 255.0, 0, 255).astype(np.uint8)
+
+
+def _blur_wide(channel: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian blur of one channel; sigmas of 2 px and up run at half resolution."""
+    if sigma < 2.0:
+        return cv2.GaussianBlur(channel, (0, 0), sigma)
+    h, w = channel.shape
+    small = cv2.resize(channel, (max(1, w // 2), max(1, h // 2)), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), sigma / 2.0)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 def reinhard_color_transfer(source: np.ndarray, target: np.ndarray,
@@ -71,27 +63,30 @@ def reinhard_color_transfer(source: np.ndarray, target: np.ndarray,
     mask: float32 (H,W) 0-1 or uint8 0/255; statistics AND correction confined to mask.
     When mask is provided, pixels outside it are left unchanged (source values).
     """
-    src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
-    tgt_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+    src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB)
+    tgt_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB)
 
-    result = src_lab.copy()
+    region = None
+    if mask is not None:
+        region = (mask > (127 if mask.dtype == np.uint8 else 0.5)).astype(np.uint8)
+        if int(region.sum()) < 10:
+            return source.copy()
+
+    src_mean, src_std = cv2.meanStdDev(src_lab, mask=region)
+    tgt_mean, tgt_std = cv2.meanStdDev(tgt_lab, mask=region)
+    # The correction is one affine map per channel of 8-bit Lab, so apply it
+    # as a lookup table instead of converting the images to float.
+    values = np.arange(256, dtype=np.float32)
+    table = np.empty((256, 1, 3), np.uint8)
     for ch in range(3):
-        if mask is not None:
-            m = mask > (127 if mask.dtype == np.uint8 else 0.5)
-            if m.sum() < 10:
-                continue
-            src_mean = src_lab[..., ch][m].mean()
-            src_std  = src_lab[..., ch][m].std() + 1e-6
-            tgt_mean = tgt_lab[..., ch][m].mean()
-            tgt_std  = tgt_lab[..., ch][m].std() + 1e-6
-            # Apply correction ONLY to masked pixels; outside stays as original source.
-            result[..., ch][m] = (src_lab[..., ch][m] - src_mean) * (tgt_std / src_std) + tgt_mean
-        else:
-            src_mean, src_std = src_lab[..., ch].mean(), src_lab[..., ch].std() + 1e-6
-            tgt_mean, tgt_std = tgt_lab[..., ch].mean(), tgt_lab[..., ch].std() + 1e-6
-            result[..., ch] = (src_lab[..., ch] - src_mean) * (tgt_std / src_std) + tgt_mean
-
-    result = np.clip(result, 0, 255).astype(np.uint8)
+        # Clamp the gain: a near-flat source region would otherwise amplify noise.
+        gain = float(np.clip((tgt_std[ch, 0] + 1e-6) / (src_std[ch, 0] + 1e-6), 0.5, 2.0))
+        table[:, 0, ch] = np.clip(
+            (values - src_mean[ch, 0]) * gain + tgt_mean[ch, 0], 0, 255).astype(np.uint8)
+    result = cv2.LUT(src_lab, table)
+    if region is not None:
+        # Apply correction ONLY to masked pixels; outside stays as original source.
+        np.copyto(result, src_lab, where=(region == 0)[..., np.newaxis])
     return cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
 
 
@@ -103,38 +98,31 @@ def low_freq_shading_correction(swapped: np.ndarray, target: np.ndarray,
     Multiplicative correction in linear (physical) light space.
     When skin_mask is provided the correction is blended in only within that region.
     """
-    # Linearize: shading is a linear-light phenomenon
-    sw_lin = _TO_LINEAR[swapped]
-    tg_lin = _TO_LINEAR[target]
-
     # The shading field is low-frequency by construction, so estimate it on a
-    # small image: area-downsample, blur with the scaled sigma, upsample the ratio.
+    # small image: area-downsample, linearize (shading is a linear-light
+    # phenomenon), blur with the scaled sigma.
     h, w = swapped.shape[:2]
     factor = max(1, int(sigma // 2.5))
     small = (max(1, w // factor), max(1, h // factor))
     small_sigma = sigma / factor
-    sw_low = cv2.GaussianBlur(cv2.resize(sw_lin, small, interpolation=cv2.INTER_AREA),
-                              (0, 0), small_sigma)
-    tg_low = cv2.GaussianBlur(cv2.resize(tg_lin, small, interpolation=cv2.INTER_AREA),
-                              (0, 0), small_sigma)
+    sw_low = cv2.GaussianBlur(
+        _TO_LINEAR[cv2.resize(swapped, small, interpolation=cv2.INTER_AREA)], (0, 0), small_sigma)
+    tg_low = cv2.GaussianBlur(
+        _TO_LINEAR[cv2.resize(target, small, interpolation=cv2.INTER_AREA)], (0, 0), small_sigma)
 
     # Multiplicative ratio; partial 0.7 and clamp prevent extreme corrections
     ratio = tg_low / (sw_low + 1e-6)
     ratio = np.clip(1.0 + (ratio - 1.0) * 0.7, 0.3, 3.0)
-    result_lin = sw_lin * cv2.resize(ratio, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    # Back to gamma
-    result = _to_gamma_u8(result_lin)
+    # Multiplying linear light by `ratio` equals multiplying the gamma-encoded
+    # image by ratio ** (1 / 2.2), so the full-size image never leaves uint8.
+    gain = cv2.resize(cv2.pow(ratio, 1.0 / 2.2), (w, h), interpolation=cv2.INTER_LINEAR)
+    result = cv2.multiply(swapped, gain, dtype=cv2.CV_8U)
 
     if skin_mask is not None:
         # Blend corrected result into original only within skin region
-        skin_f = cv2.GaussianBlur(
-            skin_mask.astype(np.float32) / 255.0, (11, 11), 3.0
-        )[..., np.newaxis]
-        result = np.clip(
-            swapped.astype(np.float32) * (1.0 - skin_f) + result.astype(np.float32) * skin_f,
-            0, 255
-        ).astype(np.uint8)
+        skin_f = cv2.GaussianBlur(skin_mask.astype(np.float32) / 255.0, (11, 11), 3.0)
+        result = cv2.blendLinear(swapped, result, 1.0 - skin_f, skin_f)
 
     return result
 
@@ -152,77 +140,73 @@ def inject_skin_detail(swapped: np.ndarray, target_registered: np.ndarray,
     """
     encoded = swapped.dtype == np.uint8
     if encoded:
-        swapped = (swapped.astype(np.float32) / 255.0) ** 2.2
-        target_registered = (target_registered.astype(np.float32) / 255.0) ** 2.2
+        lin_swapped = cv2.LUT(swapped, _TO_LINEAR)
+        lin_target = cv2.LUT(target_registered, _TO_LINEAR)
+    else:
+        lin_swapped, lin_target = swapped, target_registered
 
     def luminance(img: np.ndarray) -> np.ndarray:
         # BT.709 luminance (BGR order)
-        return 0.0722 * img[..., 0] + 0.7152 * img[..., 1] + 0.2126 * img[..., 2]
+        return cv2.transform(img, _BT709_BGR)
 
     sigma0 = max(0.35, 0.5 * face_width / 256)
     sigma1 = max(0.80, 2.0 * face_width / 256)
 
-    ls = np.log(np.maximum(luminance(swapped), 1e-4))
-    lt = np.log(np.maximum(luminance(target_registered), 1e-4))
+    ls = np.log(np.maximum(luminance(lin_swapped), 1e-4))
+    lt = np.log(np.maximum(luminance(lin_target), 1e-4))
 
-    ds = gaussian_filter(ls, sigma0) - gaussian_filter(ls, sigma1)
-    dt = gaussian_filter(lt, sigma0) - gaussian_filter(lt, sigma1)
+    # The band-pass is linear, so band(lt) - band(ls) == band(lt - ls).
+    diff = lt - ls
+    band_delta = (cv2.GaussianBlur(diff, (0, 0), sigma0, borderType=cv2.BORDER_REFLECT)
+                  - cv2.GaussianBlur(diff, (0, 0), sigma1, borderType=cv2.BORDER_REFLECT))
 
     # Edge gating: suppress transfer near strong edges
-    grad = np.abs(cv2.Sobel(ls.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)) + \
-           np.abs(cv2.Sobel(ls.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3))
+    ls32 = ls.astype(np.float32)
+    grad = np.abs(cv2.Sobel(ls32, cv2.CV_32F, 1, 0, ksize=3)) + \
+           np.abs(cv2.Sobel(ls32, cv2.CV_32F, 0, 1, ksize=3))
     edge_gate = np.exp(-grad * 10.0)
 
     safe_skin = (skin_mask > 127).astype(np.float32)
     weight = strength * safe_skin * edge_gate
-    delta = np.clip(dt - ds, -0.10, 0.10)
+    delta = np.clip(band_delta, -0.10, 0.10)
 
-    result = swapped * np.exp(weight * delta)[..., np.newaxis]
     if encoded:
-        return np.clip(np.maximum(result, 0) ** (1 / 2.2) * 255, 0, 255).astype(np.uint8)
-    return result
+        # A linear-light gain g is a gain of g ** (1 / 2.2) on the encoded image.
+        gain = np.exp(weight * delta / 2.2).astype(np.float32)
+        return cv2.multiply(swapped, cv2.merge([gain, gain, gain]), dtype=cv2.CV_8U)
+    return swapped * np.exp(weight * delta)[..., np.newaxis]
 
 
 def apply_sss(face_bgr: np.ndarray, skin_mask: np.ndarray,
               strength: float = 0.20) -> np.ndarray:
     """
     Sum-of-Gaussians SSS approximation.
-    Removes "plastic" skin look: red scatters furthest, blue barely at all.
+    Removes "plastic" skin look: red scatters furthest, blue barely at all
+    (at 512 px the blue channel is left unchanged).
     Linearizes input (gamma→linear) before blurring for physically correct scatter.
     The profile is in millimetres; sigma = sqrt(variance) scaled to crop pixels.
     """
-    w = face_bgr.shape[1]
-    px_per_mm = w / _SSS_CROP_WIDTH_MM
-    # Linearize: SSS is a linear-light phenomenon
-    face_f = _TO_LINEAR[face_bgr]
-    sss_result = np.zeros_like(face_f)
+    px_per_mm = face_bgr.shape[1] / _SSS_CROP_WIDTH_MM
+    mask = strength * cv2.GaussianBlur(skin_mask.astype(np.float32) / 255.0, (11, 11), 3.0)
+    result = face_bgr.copy()
 
-    for variance_mm2, (wr, wg, wb) in _SSS_PROFILE:
-        sigma_px = float(np.sqrt(variance_mm2)) * px_per_mm
-        # Below half a pixel the lobe is narrower than the sampling grid.
-        layer = face_f if sigma_px < 0.5 else cv2.GaussianBlur(face_f, (0, 0), sigma_px)
-        sss_result += layer * np.array([wb, wg, wr], dtype=np.float32)
-
-    mask_3ch = cv2.GaussianBlur(
-        skin_mask.astype(np.float32) / 255.0, (11, 11), 3.0
-    )[..., np.newaxis]
-    out_lin = face_f + strength * mask_3ch * (sss_result - face_f)
-    # Delinearize back to gamma
-    return _to_gamma_u8(out_lin)
-
-
-def apply_micro_texture(face_bgr: np.ndarray, skin_mask: np.ndarray,
-                        strength: float = 0.04) -> np.ndarray:
-    """Add procedural pore texture to skin region (cached Gabor tile)."""
-    h, w = face_bgr.shape[:2]
-    tile = cv2.resize(_get_pore_tile(256), (w, h))
-    face_f = face_bgr.astype(np.float32)
-    skin_norm = cv2.GaussianBlur(
-        skin_mask.astype(np.float32) / 255.0, (11, 11), 3.0
-    )[..., np.newaxis]
-    displaced = face_f * (1.0 + strength * tile[..., np.newaxis])
-    out = face_f + skin_norm * (displaced - face_f)
-    return np.clip(out, 0, 255).astype(np.uint8)
+    # Each channel's weights sum to 1, so the scattered image differs from the
+    # input only by its blurred lobes: sum(w * (blur(x) - x)). Lobes narrower
+    # than the sampling grid (sigma < 0.5 px) or carrying under 1 % of the
+    # channel's energy are skipped; a channel with none left is untouched.
+    for ch, column in ((2, 0), (1, 1), (0, 2)):   # BGR index, profile column
+        lobes = [(weights[column], float(np.sqrt(variance)) * px_per_mm)
+                 for variance, weights in _SSS_PROFILE]
+        lobes = [(wt, sigma) for wt, sigma in lobes if wt >= 0.01 and sigma >= 0.5]
+        if not lobes:
+            continue
+        # Linearize: SSS is a linear-light phenomenon
+        lin = _TO_LINEAR[face_bgr[..., ch]]
+        scatter = np.zeros_like(lin)
+        for wt, sigma in lobes:
+            scatter += wt * (_blur_wide(lin, sigma) - lin)
+        result[..., ch] = _to_gamma_u8(lin + mask * scatter)
+    return result
 
 
 def transfer_specular(target_face: np.ndarray, swapped_face: np.ndarray,
@@ -240,7 +224,7 @@ def transfer_specular(target_face: np.ndarray, swapped_face: np.ndarray,
     Returns (result_bgr, spec_mask) so the caller can store spec_mask and pass it
     back as prev_spec on the next frame.
     """
-    hsv = cv2.cvtColor(target_face, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv = cv2.cvtColor(target_face, cv2.COLOR_BGR2HSV)
     spec_new = ((hsv[..., 1] < thresh_sat) & (hsv[..., 2] > thresh_val)).astype(np.float32)
 
     # Temporal EMA to prevent boundary-crossing flicker
@@ -253,12 +237,8 @@ def transfer_specular(target_face: np.ndarray, swapped_face: np.ndarray,
     skin_norm = cv2.GaussianBlur(
         skin_mask.astype(np.float32) / 255.0, (11, 11), 3.0
     )
-    combined = (spec_smooth * skin_norm)[..., np.newaxis]
-    result = np.clip(
-        swapped_face.astype(np.float32) * (1 - combined) +
-        target_face.astype(np.float32) * combined,
-        0, 255
-    ).astype(np.uint8)
+    combined = spec_smooth * skin_norm
+    result = cv2.blendLinear(swapped_face, target_face, 1.0 - combined, combined)
     return result, spec
 
 
@@ -344,10 +324,18 @@ def composite_mouth_interior(swapped: np.ndarray, target: np.ndarray,
     Composite target's mouth interior (teeth/tongue) over swapped face.
     Preserves natural teeth appearance. mask: uint8 0/255.
     """
-    alpha = cv2.GaussianBlur(mouth_mask.astype(np.float32) / 255.0, (5, 5), 1.0)
+    x, y, bw, bh = cv2.boundingRect(mouth_mask)
+    if bw == 0:
+        return swapped
+    # 4 px of margin holds the 5x5 feather; the rest of the crop is untouched.
+    h, w = mouth_mask.shape
+    roi = np.s_[max(0, y - 4):min(h, y + bh + 4), max(0, x - 4):min(w, x + bw + 4)]
+    alpha = cv2.GaussianBlur(mouth_mask[roi].astype(np.float32) / 255.0, (5, 5), 1.0)
     alpha = alpha[..., np.newaxis]
-    result = swapped.astype(np.float32) * (1 - alpha) + target.astype(np.float32) * alpha
-    return np.clip(result, 0, 255).astype(np.uint8)
+    result = swapped.copy()
+    result[roi] = np.clip(
+        swapped[roi] * (1 - alpha) + target[roi] * alpha, 0, 255).astype(np.uint8)
+    return result
 
 
 def pct_harmonize(swapped: np.ndarray, target: np.ndarray,

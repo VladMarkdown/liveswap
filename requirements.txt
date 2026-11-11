@@ -1,13 +1,15 @@
-# Core inference: install exactly one runtime package
-# onnxruntime-gpu>=1.17.0  # CUDA: uncomment for NVIDIA and remove CPU runtime below
-# onnxruntime-directml>=1.17.0  # Windows AMD/Intel: replace CPU line
-onnxruntime>=1.17.0  # CPU default; remove when selecting CUDA or DirectML
+# Core inference: install exactly one runtime package.
+# NVIDIA (the supported real-time target) is the default; it needs the CUDA and
+# cuDNN versions listed for your onnxruntime-gpu release. The app logs which
+# provider each model actually runs on and warns on a CPU fallback.
+onnxruntime-gpu>=1.17.0
+# onnxruntime-directml>=1.17.0  # Windows AMD/Intel: use instead of the line above
+# onnxruntime>=1.17.0           # CPU only: far below real-time
 
 # Face analysis
 insightface>=0.7.3
 opencv-python>=4.9.0
 numpy>=1.26.0
-scipy>=1.12.0
 
 # Image processing
 Pillow>=10.2.0

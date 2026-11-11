@@ -22,8 +22,8 @@ class FaceEnhancer:
     Expects 512×512 FFHQ-aligned crop.
     """
 
-    def __init__(self, model_path: str | Path, gpu_vendor: str = "nvidia"):
-        self._session = create_session(model_path)
+    def __init__(self, model_path: str | Path, tensorrt: bool = False):
+        self._session = create_session(model_path, tensorrt_fp16=tensorrt)
         self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
 

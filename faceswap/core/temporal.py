@@ -4,8 +4,7 @@ Temporal consistency: One-Euro filter + EAR blink gate + motion-adaptive EMA.
 One-Euro filter applied to similarity transform parameters (NOT raw landmarks).
 Separate filter instance per parameter. Filter on normalized params (tx/W, ty/H).
 
-FaceParamSmoother: preferred over TransformSmoother for the main pipeline.
-Filters (cx, cy, log_scale, rotation) extracted from raw 5-pt landmarks and
+FaceParamSmoother filters (cx, cy, log_scale, rotation) extracted from raw 5-pt landmarks and
 reconstructs both M_swap-256 and M_ffhq-512 from the same filtered geometry,
 ensuring rotation-translation coupling across the two transforms.
 
@@ -67,55 +66,8 @@ class OneEuroFilter:
         self._dx_prev = 0.0
 
 
-class TransformSmoother:
-    """
-    Smooths similarity transform parameters using per-param One-Euro filters.
-    Parameters: tx (normalized by width), ty (normalized by height), log_scale, rotation (rad).
-
-    Prefer FaceParamSmoother for new code — it filters in landmark space and
-    guarantees coupling between rotation and translation.
-    """
-
-    def __init__(self):
-        self._filters = {
-            "tx":    OneEuroFilter(min_cutoff=2.0, beta=8.0, d_cutoff=1.0),
-            "ty":    OneEuroFilter(min_cutoff=2.0, beta=8.0, d_cutoff=1.0),
-            "scale": OneEuroFilter(min_cutoff=1.5, beta=4.0, d_cutoff=1.0),
-            "rot":   OneEuroFilter(min_cutoff=2.0, beta=2.0, d_cutoff=1.0),
-        }
-
-    def smooth(self, M: np.ndarray, frame_width: int,
-               frame_height: int | None = None,
-               dt: float = 1.0 / 30.0) -> np.ndarray:
-        """
-        Smooth a 2×3 affine matrix M.
-        Returns smoothed 2×3 affine matrix.
-        frame_height defaults to frame_width when omitted (square assumption).
-        """
-        _fh = frame_height if frame_height is not None else frame_width
-        tx = M[0, 2] / frame_width
-        ty = M[1, 2] / _fh          # Fixed: normalize by height, not width
-        scale = math.sqrt(M[0, 0] ** 2 + M[0, 1] ** 2)
-        rot = math.atan2(M[1, 0], M[0, 0])
-
-        tx_s    = self._filters["tx"](tx, dt)
-        ty_s    = self._filters["ty"](ty, dt)
-        scale_s = math.exp(self._filters["scale"](math.log(max(scale, 1e-6)), dt))
-        rot_s   = self._filters["rot"](rot, dt)
-
-        M_s = np.array([
-            [scale_s * math.cos(rot_s), -scale_s * math.sin(rot_s), tx_s * frame_width],
-            [scale_s * math.sin(rot_s),  scale_s * math.cos(rot_s), ty_s * _fh],
-        ], dtype=np.float32)
-        return M_s
-
-    def reset(self) -> None:
-        for f in self._filters.values():
-            f.reset()
-
-
 # ---------------------------------------------------------------------------
-# Face-Space Landmark Smoother (preferred over TransformSmoother)
+# Face-Space Landmark Smoother
 # ---------------------------------------------------------------------------
 
 # ArcFace 112 reference — local copy to avoid circular import with aligner.py
@@ -286,11 +238,17 @@ class TemporalEMA:
         if x2 <= x1 or y2 <= y1:
             return None, None
         roi = np.s_[y1:y2, x1:x2]
-        # Remap needs current -> previous flow, not forward flow.
+        # Remap needs current -> previous flow, not forward flow. Face motion is
+        # smooth, so estimate it at half resolution and scale the field back up.
+        rh, rw = y2 - y1, x2 - x1
+        half = (max(1, rw // 2), max(1, rh // 2))
         flow = cv2.calcOpticalFlowFarneback(
-            gray[roi], self._prev_gray[roi], None,
+            cv2.resize(gray[roi], half, interpolation=cv2.INTER_AREA),
+            cv2.resize(self._prev_gray[roi], half, interpolation=cv2.INTER_AREA), None,
             pyr_scale=0.5, levels=2, winsize=15,
             iterations=2, poly_n=5, poly_sigma=1.1, flags=0)
+        flow = cv2.resize(flow, (rw, rh), interpolation=cv2.INTER_LINEAR)
+        flow *= (rw / half[0], rh / half[1])
         self._flow_cache = (gray, roi, flow)
         return roi, flow
 

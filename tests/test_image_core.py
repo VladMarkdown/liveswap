@@ -5,7 +5,6 @@ from unittest.mock import patch
 try:
     import cv2
     import numpy as np
-    import scipy
     import onnxruntime
 except ImportError:
     np = None
@@ -26,7 +25,8 @@ class ImageCoreTests(unittest.TestCase):
                            [70.7299, 92.2041]], np.float32)
         crop, matrix = aligner.align_face(np.zeros((256, 256, 3), np.uint8), points)
         self.assertEqual(crop.shape[:2], (256, 256))
-        np.testing.assert_allclose(matrix, [[256 / 112, 0, 0], [0, 256 / 112, 0]], atol=1e-5)
+        # The iterative similarity fit lands within ~2e-5 px of the exact answer.
+        np.testing.assert_allclose(matrix, [[256 / 112, 0, 0], [0, 256 / 112, 0]], atol=1e-4)
 
     def test_paste_returns_mask_and_preserves_background(self):
         frame = np.full((512, 512, 3), 80, np.uint8)
@@ -124,6 +124,21 @@ class ImageCoreTests(unittest.TestCase):
             self.assertEqual(outputs[-1].shape, frame.shape)
             self.assertFalse(np.array_equal(outputs[-1], frame))
             np.testing.assert_array_equal(outputs[-1][:50], frame[:50])
+            # The label sits bottom-left, far from the face: only it can change those pixels.
+            self.assertFalse(np.array_equal(outputs[-1][680:710, 20:200], frame[680:710, 20:200]))
+
+    def test_frames_without_a_face_are_not_labelled(self):
+        frame, outputs, _ = self.run_pipeline([None])
+        np.testing.assert_array_equal(outputs[0], frame)
+
+    def test_restoration_fades_out_instead_of_stopping_at_once(self):
+        from faceswap.core import pipeline as pipeline_module
+        with patch.object(pipeline_module.SwapPipeline, '_should_enhance',
+                          lambda self, elapsed: self.gpen_skipped == 0 and len(self._gpen_times) < 3):
+            _, _, calls = self.run_pipeline([self.fake_face()] * 8, quality='fast')
+        # Three wanted frames ramp the blend to 0.24; two more run at 0.16 and 0.08
+        # on the way back to 0. Stopping at once would give 3.
+        self.assertEqual(calls, 5)
 
     def test_brief_detection_dropout_keeps_swapping_then_gives_up(self):
         face = self.fake_face()

@@ -30,10 +30,18 @@ GLASSES_LABEL  = 6
 EYE_LABELS     = [4, 5]
 MOUTH_INTERIOR = 11
 
-_FP32_PROVIDERS = [
-    ("CUDAExecutionProvider", {"device_id": 0}),
-    "CPUExecutionProvider",
-]
+# Mouth classes change shape within a frame or two while speaking; they are
+# decided from the current frame so the temporal smoothing cannot lag them.
+_FAST_LABELS = [11, 12, 13]
+
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+
+
+def _label_table(labels) -> np.ndarray:
+    table = np.zeros(256, dtype=np.uint8)
+    table[labels] = 255
+    return table
 
 
 class FaceParser:
@@ -53,7 +61,7 @@ class FaceParser:
         Run BiSeNet on a 512×512 face crop.
 
         Returns:
-            seg_map: (512, 512) int32 label map, 19 classes
+            seg_map: (512, 512) uint8 label map, 19 classes
         """
         h, w = face_crop_bgr.shape[:2]
         # BiSeNet expects 512×512 RGB, normalized to ImageNet stats
@@ -62,22 +70,27 @@ class FaceParser:
         else:
             img = face_crop_bgr
 
-        rgb = img[:, :, ::-1].astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        rgb = (rgb - mean) / std
-        blob = rgb.transpose(2, 0, 1)[np.newaxis]  # (1, 3, 512, 512)
+        blob = cv2.dnn.blobFromImage(img, 1.0 / 255.0, swapRB=True)  # (1, 3, 512, 512) RGB
+        blob = (blob - _MEAN) / _STD
 
         logits = self._session.run([self._output_name], {self._input_name: blob})[0]
+        # The label map only feeds feathered masks, so decide it at half
+        # resolution: a quarter of the smoothing and argmax work.
+        raw = logits[0, :, ::2, ::2]
 
         # Temporal EMA on raw logits: suppresses per-frame boundary shimmer at hair/jaw
-        if self._prev_logits is not None:
-            logits = (self._logit_ema_alpha * logits
-                      + (1.0 - self._logit_ema_alpha) * self._prev_logits)
-        self._prev_logits = logits
+        current = raw
+        if self._prev_logits is not None and self._prev_logits.shape == raw.shape:
+            smoothed = (self._logit_ema_alpha * raw
+                        + (1.0 - self._logit_ema_alpha) * self._prev_logits)
+            current = smoothed.copy()
+            current[_FAST_LABELS] = raw[_FAST_LABELS]
+            self._prev_logits = smoothed
+        else:
+            self._prev_logits = raw
 
-        seg = np.argmax(logits[0], axis=0).astype(np.int32)  # (512, 512)
-        return seg
+        seg = np.argmax(current, axis=0).astype(np.uint8)
+        return cv2.resize(seg, (512, 512), interpolation=cv2.INTER_NEAREST)
 
     def build_swap_mask(self, seg_map: np.ndarray,
                         erosion_px: int = 3,
@@ -88,9 +101,7 @@ class FaceParser:
         Returns float32 (H, W) mask in range [0, 1].
         Hair and glasses are cut out (preserved from original).
         """
-        binary = np.zeros(seg_map.shape, dtype=np.uint8)
-        for label in SWAP_LABELS:
-            binary[seg_map == label] = 255
+        binary = _label_table(SWAP_LABELS)[seg_map]
 
         # Cut hair and glasses holes
         hair = (seg_map == HAIR_LABEL).astype(np.uint8) * 255
@@ -106,10 +117,7 @@ class FaceParser:
 
     def get_region_mask(self, seg_map: np.ndarray, labels: list[int]) -> np.ndarray:
         """Binary mask for specific labels. Returns uint8 0/255."""
-        mask = np.zeros(seg_map.shape, dtype=np.uint8)
-        for label in labels:
-            mask[seg_map == label] = 255
-        return mask
+        return _label_table(labels)[seg_map]
 
     def get_skin_mask(self, seg_map: np.ndarray) -> np.ndarray:
         """Skin only (label 1), for SSS/detail injection."""

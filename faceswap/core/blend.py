@@ -34,15 +34,14 @@ def laplacian_pyramid_blend(src: np.ndarray, dst: np.ndarray,
     else:
         mask_f = mask.astype(np.float32)
 
-    # Expand mask to 3 channels
-    if mask_f.ndim == 2:
-        mask_f = np.stack([mask_f] * 3, axis=-1)
+    if mask_f.ndim == 3:
+        mask_f = mask_f[..., 0]
 
     # Fill src outside dilated mask with dst content so that reflected/replicated
     # edge pixels (from BORDER_REPLICATE warp) cannot bleed into the transition zone.
-    mask_binary = (mask_f[..., 0] > 0.01).astype(np.uint8)
-    dilated = cv2.dilate(mask_binary, _DILATE_KERNEL)[..., np.newaxis]
-    src_f = src_f * dilated + dst_f * (1 - dilated)
+    mask_binary = (mask_f > 0.01).astype(np.uint8)
+    dilated = cv2.dilate(mask_binary, _DILATE_KERNEL)
+    cv2.copyTo(dst_f, 1 - dilated, src_f)
 
     # Build Gaussian pyramids
     gp_src = [src_f]
@@ -67,10 +66,11 @@ def laplacian_pyramid_blend(src: np.ndarray, dst: np.ndarray,
     lp_blend = []
     for i in range(levels):
         m = gp_mask[i]
-        lp_blend.append(lp_src[i] * m + lp_dst[i] * (1.0 - m))
+        lp_blend.append(cv2.blendLinear(lp_src[i], lp_dst[i], m, 1.0 - m))
 
     # Reconstruct
-    result = gp_src[levels] * gp_mask[levels] + gp_dst[levels] * (1.0 - gp_mask[levels])
+    top = gp_mask[levels]
+    result = cv2.blendLinear(gp_src[levels], gp_dst[levels], top, 1.0 - top)
     for i in range(levels - 1, -1, -1):
         result = cv2.pyrUp(result, dstsize=(lp_blend[i].shape[1], lp_blend[i].shape[0]))
         result += lp_blend[i]

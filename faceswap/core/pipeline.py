@@ -75,6 +75,26 @@ class StageTimer:
         return {name: sum(v) / len(v) for name, v in self._times.items()}
 
 
+def stamp_ai_label(frame: np.ndarray) -> None:
+    """Draw a visible "AI-GENERATED FACE" label onto a swapped frame, in place.
+
+    Every frame the pipeline alters carries it, so the preview, the virtual
+    camera and the WebRTC stream all show viewers that the face is synthetic.
+    """
+    h, w = frame.shape[:2]
+    scale = max(0.4, h / 1200.0)
+    thickness = max(1, round(scale * 2))
+    text = "AI-GENERATED FACE"
+    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    pad = max(4, th // 2)
+    x0, y1 = pad * 2, h - pad * 2
+    x1, y0 = min(w, x0 + tw + pad * 2), max(0, y1 - th - baseline - pad * 2)
+    box = frame[y0:y1, x0:x1]
+    box[:] = box // 4            # dark plate keeps the text legible on any scene
+    cv2.putText(frame, text, (x0 + pad, y1 - baseline - pad), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
 def generate_profile_source_face(profile):
     """Run diffusion once at session setup, never in the frame loop."""
     from ..profile.synthesizer import generate_profile_source_face as generate
@@ -310,6 +330,7 @@ class SwapPipeline:
         full = self._ema.blend(full, gray, target.bbox, is_blinking=is_blinking,
                                face_mask=temporal_mask)
         timer.mark('temporal')
+        stamp_ai_label(full)
         self._timed_frames += 1
         if self._timed_frames % 150 == 0:
             logger.info('Stage ms: %s', ' '.join(
@@ -345,6 +366,10 @@ class AsyncPipelineRunner:
         self._threads = []
         self._stop = threading.Event()
         self._cap = None
+        # Frames that failed in process_frame are passed through unprocessed;
+        # these let the GUI say so instead of failing silently.
+        self.error_count = 0
+        self.last_error = None
 
     def start(self, cap) -> None:
         if any(t.is_alive() for t in self._threads):
@@ -411,8 +436,10 @@ class AsyncPipelineRunner:
                     break
                 try:
                     result = self._pipeline.process_frame(item)
-                except Exception:
+                except Exception as exc:
                     logger.exception('Frame processing failed')
+                    self.error_count += 1
+                    self.last_error = exc
                     result = item
                 put_latest(self._post_q, result)
         finally:
