@@ -436,7 +436,7 @@ class _LivePage(QWidget):
         column.addSpacing(10)
         column.addWidget(_divider())
         column.addWidget(_label(
-            "After starting, choose \"DirectShow Softcam\" as the camera in your video app. "
+            "After starting, choose the virtual camera named in the status bar in your video app. "
             "Every swapped frame carries a visible \"AI-GENERATED FACE\" label.",
             "muted", wrap=True))
 
@@ -1035,6 +1035,8 @@ class MainWindow(QMainWindow):
                 from faceswap.camera.virtual_cam import VirtualCamera
                 dll = str(Path("models/softcam.dll"))
                 self._vcam = VirtualCamera(1280, 720, 30.0, dll_path=dll)
+                self.statusBar().showMessage(
+                    f"Running. Camera name in video apps: {self._vcam.device_name}")
             except Exception as e:
                 self.statusBar().showMessage(f"VCam unavailable: {e}")
                 self._vcam = None

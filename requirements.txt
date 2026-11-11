@@ -20,6 +20,9 @@ scikit-image>=0.22.0
 tqdm>=4.66.0
 requests>=2.31.0
 
+# Virtual camera through OBS Studio's "OBS Virtual Camera" (OBS must be installed)
+pyvirtualcam>=0.11
+
 # GUI and image loading
 PySide6>=6.6.0
 Pillow>=10.2.0

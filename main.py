@@ -110,6 +110,18 @@ def _softcam_present() -> bool:
         return False
 
 
+def _obs_camera_present() -> bool:
+    """True if OBS Studio's virtual camera filter is registered."""
+    import winreg
+    try:
+        winreg.CloseKey(winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Classes\CLSID\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}"))
+        return True
+    except OSError:
+        return False
+
+
 def _check_models(app: QApplication) -> bool:
     """Return True if all required models are present, else show download dialog."""
     if _REQUIRED_MODEL.exists():
@@ -137,10 +149,10 @@ def main():
     window = MainWindow()
     window.show()
 
-    # Non-blocking softcam warning (models are present but softcam not registered)
-    if not _softcam_present():
+    # Non-blocking note when neither virtual camera backend is installed.
+    if not _softcam_present() and not _obs_camera_present():
         window.statusBar().showMessage(
-            "Virtual camera not installed — run download_models.py as admin")
+            "No virtual camera found: install OBS Studio to send output to video apps")
 
     sys.exit(app.exec())
 

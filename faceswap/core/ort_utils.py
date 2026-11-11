@@ -1,6 +1,8 @@
 """Shared ONNX Runtime session creation for the swap, restore, parse and occluder models."""
 from __future__ import annotations
+import importlib.util
 import logging
+import os
 from pathlib import Path
 
 import onnxruntime as ort
@@ -22,12 +24,22 @@ def preload_gpu_libraries() -> None:
         return
     _preloaded = True
     preload = getattr(ort, "preload_dlls", None)
-    if preload is None:
-        return
+    if preload is not None:
+        try:
+            preload()
+        except Exception:
+            logger.exception("Could not preload the CUDA/cuDNN libraries")
+    # The optional TensorRT pip package (tensorrt-cu13) keeps nvinfer_10.dll in
+    # site-packages/tensorrt_libs, also outside the DLL search path.
     try:
-        preload()
-    except Exception:
-        logger.exception("Could not preload the CUDA/cuDNN libraries")
+        spec = importlib.util.find_spec("tensorrt_libs")
+    except (ImportError, ValueError):
+        spec = None
+    if spec is not None and spec.submodule_search_locations:
+        folder = list(spec.submodule_search_locations)[0]
+        os.environ["PATH"] = folder + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(folder)
 
 
 def create_session(model_path: str | Path, tensorrt_fp16: bool = False) -> ort.InferenceSession:
