@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import threading
 from pathlib import Path
 
@@ -1019,6 +1020,7 @@ class MainWindow(QMainWindow):
 
                 self._signals.startup_ready.emit((pipeline, cap))
             except Exception as exc:
+                logging.getLogger(__name__).exception("Startup failed")
                 self._signals.failed.emit("Startup failed", str(exc))
 
         gc.collect()

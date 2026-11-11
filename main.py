@@ -138,6 +138,13 @@ def _check_models(app: QApplication) -> bool:
 def main():
     # Without this the pipeline's INFO-level stage timings are never shown.
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(message)s')
+    # Also keep a log file, so a failure on someone else's PC can be read afterwards.
+    from logging.handlers import RotatingFileHandler
+    Path("logs").mkdir(exist_ok=True)
+    log_file = RotatingFileHandler("logs/liveswap.log", maxBytes=2_000_000, backupCount=2,
+                                   encoding="utf-8")
+    log_file.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
+    logging.getLogger().addHandler(log_file)
     app = QApplication(sys.argv)
     app.setApplicationName("liveswap")
     app.setOrganizationName("liveswap")

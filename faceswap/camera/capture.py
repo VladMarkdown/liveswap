@@ -44,7 +44,9 @@ class CaptureThread:
         if not self._cap.isOpened():
             self._cap.release()
             self._cap = None
-            raise RuntimeError(f"Cannot open camera {self.source}")
+            raise RuntimeError(
+                f"Cannot open camera {self.source}. If another program is using it "
+                "(Telegram, Zoom, Discord), close the camera there and press Start again.")
         if local_windows_camera:
             # Uncompressed YUY2 over USB 2 caps many webcams near 10 fps at 720p.
             # The codec must be requested before the frame size.
